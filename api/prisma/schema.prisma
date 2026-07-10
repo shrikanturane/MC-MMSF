@@ -445,6 +445,7 @@ model Agent {
   name        String
   displayName String? // optional operator-typed name (overrides the VM hostname in the UI)
   machineId   String? // stable per-machine id (Linux /etc/machine-id, Windows MachineGuid) — dedup key on re-install
+  token       String?  @unique // per-agent secret issued on first check-in; presented instead of the shared key thereafter (rotatable, revocable)
   version     String? // agent build version it last reported — compared to the server's AGENT_VERSION to flag/auto-update
   hostname   String?
   altHosts   String    @default("") // ssh-pull: comma-separated alternate IPs (public/private) for failover

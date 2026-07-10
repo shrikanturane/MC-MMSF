@@ -58,7 +58,7 @@ function Write-Log([string]$m) { try { ("{0}  {1}" -f (Get-Date -Format s), $m) 
 function New-DefaultConfig {
     $port = 0; if (-not [int]::TryParse([string]$DefaultPort, [ref]$port) -or $port -le 0) { $port = 9182 }
     [pscustomobject]@{
-        MCMFIP = $DefaultIp; Port = $port; Key = $DefaultKey; HeartbeatSec = 30
+        MCMFIP = $DefaultIp; Port = $port; Key = $DefaultKey; Token = ''; HeartbeatSec = 30
         # Pure outbound by default: the agent dials MCMF over HTTPS (push + command long-poll). The
         # inbound PULL listener is OFF (no firewall port) — set Pull=$true only for the legacy model.
         Push = $true; Pull = $false; AllowAnyNetwork = $true; PullAllowFrom = ''; AdminHash = ''; AdminSalt = ''
@@ -76,6 +76,7 @@ function Merge-Config($c) {
     if ($c) {
         if ($c.MCMFIP)    { $d.MCMFIP = [string]$c.MCMFIP }
         if ($c.Key)       { $d.Key = [string]$c.Key }
+        if ($c.Token)     { $d.Token = [string]$c.Token }
         if ($c.AdminHash) { $d.AdminHash = [string]$c.AdminHash }
         if ($c.AdminSalt) { $d.AdminSalt = [string]$c.AdminSalt }
         $p = 0; if ([int]::TryParse([string]$c.Port, [ref]$p) -and $p -gt 0) { $d.Port = $p }
@@ -97,6 +98,9 @@ function Load-Config {
     return $m
 }
 function Save-Config($c) { $c | ConvertTo-Json -Depth 6 | Set-Content -Path $CfgFile -Encoding UTF8 }
+# The per-agent token (issued by the server on first check-in) is presented instead of the shared
+# bootstrap Key for runtime calls; the server accepts either, so this never breaks an enrolled agent.
+function Get-AuthKey($c) { if ($c -and $c.Token) { return [string]$c.Token } else { return [string]$c.Key } }
 $Global:Cfg = Load-Config
 
 # ---- admin gate ---------------------------------------------------------------------
@@ -226,9 +230,10 @@ function Send-Heartbeat {
         [McmfCert]::TrustAll()
         try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls13 -bor [Net.SecurityProtocolType]::Tls12 } catch { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 }
         $body=(Get-Snapshot | ConvertTo-Json -Depth 6); $uri="https://"+$Cfg.MCMFIP+"/api/agent/ingest"
-        $resp=Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'application/json' -Headers @{ 'x-agent-key'=$Cfg.Key } -TimeoutSec 12
+        $resp=Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'application/json' -Headers @{ 'x-agent-key'=(Get-AuthKey $Cfg) } -TimeoutSec 12
         $Global:LastBeat='OK '+(Get-Date -Format 'HH:mm:ss')
         if ($resp -and $resp.agentId) { $Global:AgentId=[string]$resp.agentId }   # learn our id for the command channel
+        if ($resp -and $resp.agentToken -and ([string]$resp.agentToken -ne [string]$Cfg.Token)) { $Cfg.Token=[string]$resp.agentToken; Save-Config $Cfg; Write-Log 'adopted per-agent token' }   # present it instead of the shared key from now on
         # Auto-update: the server returns its current agent build. If we're older, self-update once (the
         # bootstrap clean-upgrades in place + restarts the service on the new version).
         if ($resp -and $resp.agentVersion -and ([string]$resp.agentVersion -ne [string]$Global:AgentVersion) -and (-not $Global:UpdateTriggered)) {
@@ -242,7 +247,11 @@ function Send-Heartbeat {
         }
         # FUTURE AAA HOOK: AAA/NAC server may return an ACL directive for this user+posture; enforcement added with the AAA build.
         if ($resp -and $resp.acl) { Write-Log ('AAA ACL directive: '+($resp.acl | ConvertTo-Json -Compress)) }
-    } catch { $Global:LastBeat='FAILED: '+$_.Exception.Message; Write-Log ('push failed: '+$_.Exception.Message) }
+    } catch {
+        # Token rejected (revoked / server DB reset / corrupt) -> drop it and fall back to the shared Key.
+        try { if ($Cfg.Token -and $_.Exception.Response -and ([int]$_.Exception.Response.StatusCode -eq 401)) { $Cfg.Token=''; Save-Config $Cfg; Write-Log 'token rejected - reverting to shared key' } } catch {}
+        $Global:LastBeat='FAILED: '+$_.Exception.Message; Write-Log ('push failed: '+$_.Exception.Message)
+    }
 }
 function Test-McmfReachable { try { $hp=($Cfg.MCMFIP -split ':'); $h=$hp[0]; $pt=if($hp.Count -gt 1){[int]$hp[1]}else{443}; (Test-NetConnection -ComputerName $h -Port $pt -InformationLevel Quiet -WarningAction SilentlyContinue) } catch { $false } }
 
@@ -252,7 +261,7 @@ function Send-CommandResult($id,$status,$result,$code) {
     try {
         [McmfCert]::TrustAll()
         $body=@{ commandId=$id; status=$status; result=[string]$result; exitCode=$code } | ConvertTo-Json
-        Invoke-RestMethod -Uri ("https://"+$Cfg.MCMFIP+"/api/agent/command-result") -Method Post -Body $body -ContentType 'application/json' -Headers @{ 'x-agent-key'=$Cfg.Key } -TimeoutSec 12 | Out-Null
+        Invoke-RestMethod -Uri ("https://"+$Cfg.MCMFIP+"/api/agent/command-result") -Method Post -Body $body -ContentType 'application/json' -Headers @{ 'x-agent-key'=(Get-AuthKey $Cfg) } -TimeoutSec 12 | Out-Null
     } catch { Write-Log ('result post failed: '+$_.Exception.Message) }
 }
 function Invoke-AgentCommand($c) {
@@ -283,7 +292,7 @@ function Open-ConsoleTunnel($sessionId, $targetPort) {
     try {
         [McmfCert]::TrustAll()
         $ws=New-Object System.Net.WebSockets.ClientWebSocket
-        $uri=[Uri]("wss://"+$Cfg.MCMFIP+"/api/agent/tunnel?session="+$sessionId+"&k="+[uri]::EscapeDataString($Cfg.Key))
+        $uri=[Uri]("wss://"+$Cfg.MCMFIP+"/api/agent/tunnel?session="+$sessionId+"&k="+[uri]::EscapeDataString((Get-AuthKey $Cfg)))
         $ws.ConnectAsync($uri,[Threading.CancellationToken]::None).Wait()
         $tcp=New-Object System.Net.Sockets.TcpClient('127.0.0.1',[int]$targetPort); $stream=$tcp.GetStream()
         $shared=[hashtable]::Synchronized(@{ ws=$ws; stream=$stream; tcp=$tcp; stop=$false })
@@ -302,7 +311,7 @@ function Poll-Commands {
     if ([string]::IsNullOrEmpty($Global:AgentId)) { return }
     try {
         [McmfCert]::TrustAll()
-        $uri="https://"+$Cfg.MCMFIP+"/api/agent/commands?agentId="+$Global:AgentId+"&k="+[uri]::EscapeDataString($Cfg.Key)
+        $uri="https://"+$Cfg.MCMFIP+"/api/agent/commands?agentId="+$Global:AgentId+"&k="+[uri]::EscapeDataString((Get-AuthKey $Cfg))
         $resp=Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 35
         if ($resp.active -eq $false) { Write-Log 'decommissioned by MCMF — exiting'; [Environment]::Exit(0) }
         foreach ($c in @($resp.commands)) { if ($c) { Invoke-AgentCommand $c } }

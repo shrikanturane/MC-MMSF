@@ -6,7 +6,7 @@
 #
 #  Tokens replaced by MCMF when served:  __MCMF_URL__  __MCMF_KEY__  __MCMF_INTERVAL__
 # =====================================================================================
-import json, os, ssl, socket, subprocess, time, threading, struct, base64, urllib.request, urllib.parse
+import json, os, ssl, socket, subprocess, time, threading, struct, base64, urllib.request, urllib.parse, urllib.error
 
 MCMF_URL = "__MCMF_URL__".rstrip("/")        # e.g. https://mcmf.example.com:8443 (any port)
 KEY      = "__MCMF_KEY__"
@@ -22,6 +22,38 @@ CTX.verify_mode = ssl.CERT_NONE
 AGENT_ID = None
 UPDATING = False
 
+# Per-agent token: issued by the server on first check-in and persisted next to the agent. Presented
+# INSTEAD of the shared bootstrap KEY thereafter, so one leaked agent no longer authenticates the fleet.
+# Falls back to KEY until a token has been issued/persisted (the server accepts either).
+TOKEN_FILE = os.path.join(os.path.dirname(SELF), ".agent-token")
+
+
+def _load_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return (f.read().strip() or None)
+    except Exception:
+        return None
+
+
+TOKEN = _load_token()
+
+
+def _adopt_token(resp):
+    global TOKEN
+    try:
+        t = (resp or {}).get("agentToken")
+        if t and t != TOKEN:
+            with open(TOKEN_FILE, "w") as f:
+                f.write(t)
+            try:
+                os.chmod(TOKEN_FILE, 0o600)
+            except Exception:
+                pass
+            TOKEN = t
+    except Exception:
+        pass
+
 
 def self_update():
     # Re-download the latest agent (baked with the new version) and restart the service on it. Used by
@@ -33,13 +65,28 @@ def self_update():
     subprocess.Popen(["bash", "-c", "curl -fsSk '%s/api/agent/linux?k=%s' -o '%s' && (sudo systemctl restart mcmf-agent || systemctl restart mcmf-agent)" % (MCMF_URL, urllib.parse.quote(KEY), SELF)])
 
 
+def _forget_token():
+    # Token rejected (revoked / server DB reset / corrupt) -> drop it and fall back to the shared KEY.
+    global TOKEN
+    TOKEN = None
+    try:
+        os.remove(TOKEN_FILE)
+    except Exception:
+        pass
+
+
 def http(method, path, body=None, timeout=35):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(MCMF_URL + path, data=data, method=method)
     req.add_header("Content-Type", "application/json")
-    req.add_header("x-agent-key", KEY)
-    with urllib.request.urlopen(req, context=CTX, timeout=timeout) as r:
-        return json.loads(r.read().decode() or "{}")
+    req.add_header("x-agent-key", TOKEN or KEY)
+    try:
+        with urllib.request.urlopen(req, context=CTX, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as ex:
+        if ex.code == 401 and TOKEN:
+            _forget_token()
+        raise
 
 
 def _cpu_pct():
@@ -111,6 +158,7 @@ def push():
     try:
         r = http("POST", "/api/agent/ingest", telemetry())
         AGENT_ID = r.get("agentId") or AGENT_ID
+        _adopt_token(r)   # persist + present the per-agent token going forward
         # Auto-update: the server returns its current agent build; if we're older, self-update once.
         sv = r.get("agentVersion")
         if sv and sv != VERSION:
@@ -184,7 +232,7 @@ def console_open(session_id, target_port):
         host, port = u.hostname, (u.port or 443)
         raw = socket.create_connection((host, port), timeout=15)
         ws = CTX.wrap_socket(raw, server_hostname=host)
-        _ws_handshake(ws, host, "/api/agent/tunnel?session=%s&k=%s" % (urllib.parse.quote(session_id), urllib.parse.quote(KEY)))
+        _ws_handshake(ws, host, "/api/agent/tunnel?session=%s&k=%s" % (urllib.parse.quote(session_id), urllib.parse.quote(TOKEN or KEY)))
         local = socket.create_connection(("127.0.0.1", int(target_port)), timeout=10)
         stop = threading.Event()
 
@@ -270,7 +318,7 @@ def command_loop():
         if not AGENT_ID:
             time.sleep(2); continue
         try:
-            q = urllib.parse.urlencode({"agentId": AGENT_ID, "k": KEY})
+            q = urllib.parse.urlencode({"agentId": AGENT_ID, "k": (TOKEN or KEY)})
             r = http("GET", "/api/agent/commands?" + q, None, timeout=35)
             if not r.get("active", True):
                 os._exit(0)              # admin decommissioned this agent → stop

@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit, UnauthorizedException } from '@nestjs/common';
 import { Client } from 'ssh2';
 import * as net from 'node:net';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, randomBytes } from 'node:crypto';
 import { sysParams, pInt } from '../../system-params';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -18,7 +18,7 @@ import { encryptJson, decryptJson } from '../../connectors/crypto';
  * on each ingest so an installed agent can self-update when it's older. BUMP THIS whenever the agent
  * scripts (mcmf-tray-agent.ps1 / mcmf-agent-linux.py / the installer) change.
  */
-export const AGENT_VERSION = '1.6.0';
+export const AGENT_VERSION = '1.7.0';
 
 /** Shared agent ingest key (stable, derived from the app key unless overridden). */
 function agentKey(): string {
@@ -585,6 +585,16 @@ export class AgentService implements OnModuleInit {
       await this.prisma.agent.deleteMany({ where: { id: { not: agent.id }, OR: [{ machineId }, { hostname, machineId: null }] } }).catch(() => undefined);
     }
 
+    // Issue a per-agent token on first check-in (rotatable/revocable). The agent adopts it and presents
+    // it INSTEAD of the shared bootstrap key thereafter, so one leaked agent key no longer authenticates
+    // the whole fleet. The shared key is still accepted alongside (assertKeyOrToken), so agents that
+    // haven't adopted a token yet keep working — zero breakage.
+    let agentToken: string | null = (agent as any).token ?? null;
+    if (!agentToken) {
+      agentToken = randomBytes(24).toString('base64url');
+      await this.prisma.agent.update({ where: { id: agent.id }, data: { token: agentToken } as any }).catch(() => { agentToken = null; });
+    }
+
     // Unify the agent host into the fleet: mirror onto its matched cloud Resource, or — when it's an
     // endpoint/guest-agent host with no cloud match — create a first-class Resource so it shows in the
     // VM list + inventory + Monitoring and can be monitored & secured like everything else.
@@ -649,7 +659,24 @@ export class AgentService implements OnModuleInit {
     // The response tells the agent whether to keep running and how often to report.
     // Exiting requires an admin to decommission (active=false) — or root stopping the service.
     // agentVersion lets the agent self-update when it's older than the server's current build.
-    return { ok: true, agentId: agent.id, agentVersion: AGENT_VERSION, matchedResource: match?.name ?? null, events: events.length, active: agent.active, intervalSec: agent.intervalSec };
+    return { ok: true, agentId: agent.id, agentToken, agentVersion: AGENT_VERSION, matchedResource: match?.name ?? null, events: events.length, active: agent.active, intervalSec: agent.intervalSec };
+  }
+
+  /**
+   * Accept EITHER the shared bootstrap key (constant-time) OR a per-agent token issued on check-in.
+   * Backward-compatible: agents still presenting the shared key authenticate exactly as before.
+   */
+  async assertKeyOrToken(key?: string): Promise<void> {
+    const k = String(key ?? '');
+    const expected = agentKey();
+    const a = Buffer.from(k);
+    const b = Buffer.from(expected);
+    if (a.length === b.length && timingSafeEqual(a, b)) return;
+    if (k.length >= 24) {
+      const found = await this.prisma.agent.findFirst({ where: { token: k }, select: { id: true } }).catch(() => null);
+      if (found) return;
+    }
+    throw new UnauthorizedException('invalid agent key');
   }
 
   /** Admin: change reporting interval or decommission (active=false → agent self-exits). */
@@ -1065,7 +1092,7 @@ export class AgentService implements OnModuleInit {
    * by the agent key. Also marks the agent as an outbound/tunnel agent and records liveness.
    */
   async longPollCommands(agentId: string, key: string, host?: string) {
-    this.assertKey(key);
+    await this.assertKeyOrToken(key);
     const agent = await this.prisma.agent.findUnique({ where: { id: agentId } });
     if (!agent) throw new NotFoundException('agent not found');
     const homeUrl = this.baseUrl(host);
@@ -1092,7 +1119,7 @@ export class AgentService implements OnModuleInit {
 
   /** Agent posts a command result back over the same outbound channel. */
   async commandResult(key: string, body: { commandId?: string; status?: string; result?: string; exitCode?: number }) {
-    this.assertKey(key);
+    await this.assertKeyOrToken(key);
     const id = String(body?.commandId ?? '');
     const cmd = await this.prisma.agentCommand.findUnique({ where: { id } }).catch(() => null);
     if (!cmd) throw new NotFoundException('command not found');

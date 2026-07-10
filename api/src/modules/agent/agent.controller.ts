@@ -11,8 +11,8 @@ export class AgentController {
   // Machine-to-machine ingest: authenticated by the x-agent-key header, not a user JWT.
   @Public()
   @Post('ingest')
-  ingest(@Headers('x-agent-key') key: string, @Body() body: any) {
-    this.service.assertKey(key);
+  async ingest(@Headers('x-agent-key') key: string, @Body() body: any) {
+    await this.service.assertKeyOrToken(key);
     return this.service.ingest(body ?? {});
   }
 
