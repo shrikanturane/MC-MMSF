@@ -1,0 +1,1080 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Provider {
+  aws
+  azure
+  gcp
+  private
+  docker
+  linux
+  windows
+  vmware
+  esxi
+  nutanix
+  proxmox
+  kvm
+}
+
+enum AccountStatus {
+  connected
+  warning
+  error
+  disconnected
+}
+
+enum ResourceType {
+  compute
+  storage
+  network
+  database
+  container
+  serverless
+  security
+  analytics
+  other
+}
+
+enum ResourceStatus {
+  running
+  stopped
+  degraded
+  terminated
+}
+
+enum Severity {
+  critical
+  high
+  medium
+  low
+}
+
+enum FindingType {
+  vulnerability
+  misconfiguration
+  threat
+}
+
+enum FindingStatus {
+  open
+  investigating
+  resolved
+}
+
+enum IncidentStatus {
+  open
+  acknowledged
+  resolved
+}
+
+enum AlertStatus {
+  active
+  acknowledged
+  resolved
+}
+
+enum WorkflowStatus {
+  enabled
+  disabled
+}
+
+enum IntegrationStatus {
+  connected
+  disconnected
+  error
+}
+
+// ── Cloud accounts ────────────────────────────────────────────────
+model CloudAccount {
+  id           String        @id @default(cuid())
+  name         String
+  provider     Provider
+  accountRef   String // external account id / subscription / project
+  region       String
+  status       AccountStatus @default(connected)
+  resourceCount Int          @default(0)
+  monthlyCost  Float         @default(0)
+  createdAt    DateTime      @default(now())
+
+  resources   Resource[]
+  connectionId String?      @unique
+  connection   CloudConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+}
+
+// ── Cloud connections (hold credentials; drive real discovery) ─────
+model CloudConnection {
+  id            String    @id @default(cuid())
+  name          String
+  provider      Provider
+  // AES-256-GCM encrypted JSON blob of provider credentials. NEVER returned to the client.
+  credentials   String
+  // External identifier surfaced in the UI (subscriptionId / accountId / project / host).
+  accountRef    String    @default("")
+  status        String    @default("pending") // pending | connected | error
+  lastSyncAt    DateTime?
+  lastSyncError String?
+  assetsFound   Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt @default(now())
+
+  cloudAccount  CloudAccount?
+
+  // FinOps — refreshed from the provider's cost API
+  monthlyCost     Float     @default(0)
+  costByService   Json?
+  currency        String?
+  costRefreshedAt DateTime?
+  costNote        String    @default("") // why cost is unavailable (e.g. enable Cost Explorer / set BigQuery billing table)
+  // Compliance — refreshed from the provider's regulatory-compliance API
+  compliance      Json?
+}
+
+// Where automation "notify" actions are delivered.
+model NotificationChannel {
+  id        String   @id @default(cuid())
+  name      String
+  type      String // slack | webhook
+  target    String // webhook / Slack incoming-webhook URL
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+// ── Resources (inventory) ─────────────────────────────────────────
+model Resource {
+  id          String         @id @default(cuid())
+  name        String
+  externalId  String         @unique
+  provider    Provider
+  type        ResourceType
+  region      String
+  status      ResourceStatus @default(running)
+  cpuPct      Float          @default(0)
+  memoryPct   Float          @default(0)
+  monthlyCost Float          @default(0)
+  diskPct     Float?         // agent-based
+  networkMbps Float?         // latest network throughput
+  metricHistory Json         @default("[]") // capped [{ ts, cpu, mem, disk, net }] for per-VM trends
+  service     String // e.g. "EC2", "Blob Storage", "Cloud SQL"
+  source      String         @default("seed") // seed | discovered
+  properties  Json?          // provider-native properties from discovery
+  lastSeenAt  DateTime?
+  createdAt   DateTime       @default(now())
+
+  cloudAccountId String?
+  cloudAccount   CloudAccount? @relation(fields: [cloudAccountId], references: [id])
+
+  findings SecurityFinding[]
+}
+
+// ── Fleet-wide hourly metric aggregate (charts) ───────────────────
+model MetricPoint {
+  id          String   @id @default(cuid())
+  ts          DateTime
+  avgCpu      Float
+  avgMemory   Float
+  networkGbps Float
+  avgDisk     Float    @default(0)
+  networkMbps Float    @default(0)
+  latencyMs   Float? // avg reachability RTT across "up" monitors (null = none)
+  jitterMs    Float? // avg reachability jitter across "up" monitors
+  errorRate   Float    @default(0)
+
+  @@index([ts])
+}
+
+// ── Security ──────────────────────────────────────────────────────
+// API key for the open integration API (/api/v1) — 3rd-party ITSM & monitoring tools.
+model ApiKey {
+  id         String    @id @default(cuid())
+  name       String // operator label, e.g. "ServiceNow", "Datadog"
+  prefix     String // first 8 chars of the key, shown in the UI (the full key is never stored)
+  keyHash    String    @unique // sha-256 of the full key
+  scopes     String    @default("read") // csv: read,alerts (future: write)
+  createdBy  String? // user id
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([revokedAt])
+}
+
+model SecurityFinding {
+  id           String        @id @default(cuid())
+  title        String
+  type         FindingType
+  severity     Severity
+  status       FindingStatus @default(open)
+  provider     Provider
+  detectedAt   DateTime      @default(now())
+  // Real-cloud ingestion (Defender / Security Hub / SCC)
+  externalId   String?       @unique
+  source       String? // defender | securityhub | guardduty | scc | seed
+  connectionId String?
+  resourceName String?
+
+  resourceId String?
+  resource   Resource? @relation(fields: [resourceId], references: [id])
+}
+
+model ComplianceFramework {
+  id     String @id @default(cuid())
+  name   String @unique // CIS, SOC2, ISO 27001, HIPAA, PCI DSS, NIST
+  score  Int // 0-100
+  passed Int
+  total  Int
+}
+
+// ── Operations ────────────────────────────────────────────────────
+model Incident {
+  id         String         @id @default(cuid())
+  title      String
+  severity   Severity
+  status     IncidentStatus @default(open)
+  provider   Provider
+  resourceName String?
+  openedAt   DateTime       @default(now())
+  resolvedAt DateTime?
+}
+
+model Alert {
+  id           String      @id @default(cuid())
+  title        String
+  severity     Severity
+  source       String
+  status       AlertStatus @default(active)
+  raisedAt     DateTime    @default(now())
+  // Threshold-engine linkage
+  ruleId       String?
+  resourceId   String?
+  resourceName String?
+  metric       String?
+  value        Float?
+  resolvedAt   DateTime?
+  escalated    Boolean     @default(false)
+  escalatedAt  DateTime?
+  // Idempotency for per-workflow escalation tiers: ["<workflowId>:<tierIndex>", …] already fired.
+  firedEscalations Json    @default("[]")
+
+  @@index([ruleId, resourceId, status])
+}
+
+// Customizable alert rule: e.g. cpu > 85 (high), memory >= 90, disk >= 95.
+model AlertRule {
+  id            String   @id @default(cuid())
+  name          String
+  kind          String   @default("threshold") // threshold | event
+  metric        String   @default("cpu") // cpu | memory | disk | network (threshold rules)
+  comparator    String   @default("gt") // gt | gte | lt | lte
+  threshold     Float    @default(0)
+  event         String? // vm_power_off | vm_power_on | device_unreachable | agent_offline (event rules)
+  severity      Severity @default(high)
+  scopeProvider String? // null = all providers
+  scopeEnv      String? // null = all environments (threshold rules)
+  notify        Json     @default("[]") // delivery: ["popup","email","whatsapp"]
+  notifyEmail   String? // optional per-rule email recipient (overrides/adds to channels)
+  notifyPhone   String? // optional per-rule WhatsApp number
+  enabled       Boolean  @default(true)
+  createdAt     DateTime @default(now())
+}
+
+// ── CIEM — cloud identities & entitlements (thesis 6.3/6.4) ───────
+// One row per identity per provider. `privilege` is the classified tier from the
+// attached roles/policies; `source` separates sandboxed validation identities
+// (seeded with ground-truth labels) from live cloud ingestion.
+model CloudIdentity {
+  id           String    @id @default(cuid())
+  provider     Provider
+  connectionId String?
+  externalId   String // provider-side id / principal id / email
+  name         String
+  email        String? // cross-cloud matching key
+  kind         String    @default("user") // user | group | role | serviceAccount
+  privilege    String    @default("custom") // admin | write | read | custom
+  permissions  Json      @default("[]") // attached role/policy names
+  lastUsedAt   DateTime?
+  source       String    @default("cloud") // cloud | sandbox
+  syncedAt     DateTime  @default(now())
+
+  @@unique([provider, externalId])
+  @@index([source, provider])
+  @@index([email])
+}
+
+// ── AIOps anomaly detection (aiops-engine v2) ─────────────────────
+// One row per detector finding. detectorType keeps statistical anomalies (cost/behaviour)
+// and plain rule breaches (threshold) clearly separated. isConfirmed is the human label:
+// null = unreviewed, true = confirmed real (also the external-notify gate), false = false positive.
+model AnomalyDetection {
+  id           String    @id @default(cuid())
+  resourceId   String
+  resourceName String
+  provider     Provider
+  detectorType String // cost | behaviour | threshold
+  metric       String // cost | cpu | memory | disk | net
+  score        Float // modified z (statistical) or distance over the rule level (threshold)
+  baseline     String // self | cohort | rule
+  threshold    Float
+  value        Float
+  severity     Severity
+  reason       String
+  isConfirmed  Boolean?
+  confirmedBy  String? // reviewer email/id
+  alertId      String? // in-app Alert raised for high severity
+  source       String    @default("live") // live | eval (harness rows are kept out of the live feed)
+  detectedAt   DateTime  @default(now())
+
+  @@index([source, detectorType, isConfirmed, detectedAt])
+  @@index([resourceId, detectorType, metric, detectedAt])
+}
+
+model AutomationWorkflow {
+  id           String         @id @default(cuid())
+  name         String
+  trigger      String // human description
+  status       WorkflowStatus @default(enabled)
+  runs         Int            @default(0)
+  lastRun      DateTime?
+  // Trigger matching + action
+  triggerKind  String         @default("any") // any | severity | metric
+  triggerValue String? // severity name or metric name
+  actionType   String         @default("notify") // notify | webhook | stop_vm | restart_vm
+  actionConfig Json?
+  // Multi-step builder (#15): extra AND-conditions + an ordered list of action steps.
+  // When `steps` is non-empty it supersedes the single actionType above.
+  conditions   Json           @default("[]") // [{ field, op, value }]
+  steps        Json           @default("[]") // [{ type, config }] — immediate "Then" actions
+  // Unified escalation: ordered tiers run when a matching alert stays unresolved.
+  // [{ afterMinutes:number, steps:[{ type, config }] }] — replaces the standalone EscalationPolicy.
+  escalation   Json           @default("[]")
+}
+
+// Escalation: unresolved alert of a severity older than N minutes → fire an action.
+model EscalationPolicy {
+  id           String   @id @default(cuid())
+  name         String
+  afterMinutes Int      @default(15)
+  severity     Severity @default(critical)
+  actionType   String   @default("notify") // webhook | notify
+  target       String?
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+}
+
+// ── Settings ──────────────────────────────────────────────────────
+model Integration {
+  id      String            @id @default(cuid())
+  name    String // Slack, PagerDuty, Generic Webhook
+  kind    String // slack | pagerduty | webhook
+  target  String
+  status  IntegrationStatus @default(disconnected)
+}
+
+// System event log — platform activity feed (alerts, syncs, control, findings, cost).
+model EventLog {
+  id           String   @id @default(cuid())
+  ts           DateTime @default(now())
+  type         String // alert | sync | control | finding | cost | discovery | system
+  severity     String   @default("info") // info | warning | critical
+  title        String
+  detail       String?
+  resourceName String?
+  provider     String?
+
+  @@index([ts])
+}
+
+// User-built draggable/resizable dashboards, keyed by board ("custom", "monitoring").
+model DashboardLayout {
+  key       String   @id @default("custom")
+  panels    Json     @default("[]")
+  updatedAt DateTime @updatedAt @default(now())
+}
+
+// Editable compliance checklist (CIS / ISO / PCI controls) — completed vs not.
+model ComplianceItem {
+  id          String   @id @default(cuid())
+  standard    String // CIS Benchmark | ISO 27001 | PCI DSS | HIPAA | NIST CSF
+  control     String
+  description String?
+  status      String   @default("passed") // passed | failed | na
+  source      String   @default("manual") // manual | defender
+  externalId  String?  @unique
+  sort        Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([standard])
+}
+
+// IP / host up-down monitor.
+model Monitor {
+  id            String    @id @default(cuid())
+  name          String
+  target        String // primary ip, hostname or URL
+  altTargets    String    @default("") // comma-separated alternate IPs for the SAME device (failover)
+  type          String    @default("ping") // ping | tcp | http
+  port          Int?
+  group         String    @default("default")
+  enabled       Boolean   @default(true)
+  status        String    @default("unknown") // up | down | unknown
+  lastAddress   String? // which IP last answered (primary or an alternate)
+  lastLatencyMs Int?
+  lastCheckedAt DateTime?
+  history       Json      @default("[]") // recent [{ts, up, ms}] for uptime sparkline
+  // Network-device monitoring (firewall / router / switch) via SNMP.
+  deviceKind    String    @default("host") // host | firewall | router | switch | server | other
+  snmpCommunity String    @default("") // SNMP v2c read community ('' = SNMP off)
+  jitterMs      Float? // RTT jitter (mean abs diff of recent latencies)
+  uptimeSec     Int? // device sysUpTime
+  deviceMac     String? // device's own base MAC (from ifPhysAddress) — asset tracking
+  lastSnmpAt    DateTime? // last successful SNMP poll (used for SNMP status)
+  interfaces    Json      @default("[]") // [{ index,name,status,speedMbps,inBps,outBps,utilPct,mac }]
+  neighbors     Json      @default("[]") // connected devices: [{ mac, ip?, ifName? }]
+  snmpState     Json      @default("{}") // prev octet counters + if-status for deltas/transitions
+  createdAt     DateTime  @default(now())
+}
+
+// A guest agent installed on a VM/host, reporting telemetry + events.
+model Agent {
+  id          String    @id @default(cuid())
+  name        String
+  displayName String? // optional operator-typed name (overrides the VM hostname in the UI)
+  machineId   String? // stable per-machine id (Linux /etc/machine-id, Windows MachineGuid) — dedup key on re-install
+  version     String? // agent build version it last reported — compared to the server's AGENT_VERSION to flag/auto-update
+  hostname   String?
+  altHosts   String    @default("") // ssh-pull: comma-separated alternate IPs (public/private) for failover
+  ownerId    String    @default("") // ssh-pull: user whose vault credential MCMF pulls with
+  pullKey    String    @default("") // http-pull: bearer key MCMF presents to the VM agent
+  os         String?
+  osVersion  String? // detailed OS caption for inventory drill-down, e.g. "Windows Server 2022" / "Ubuntu 22.04"
+  ips        String    @default("") // comma-separated
+  resourceId String? // matched Resource id
+  cpuPct     Float?
+  memPct     Float?
+  diskPct    Float?
+  netMbps    Float?
+  diskIoKbps Float? // disk read+write throughput (KB/s)
+  services   Json      @default("[]") // [{name,status,cpu,mem,diskKbps}]
+  openPorts  Json      @default("[]") // listening ports: [number] or [{port,proc}]
+  connections Json     @default("[]") // established → remote: [{raddr,rport,lport,proc,state}]
+  installedApps Json   @default("[]") // installed-software inventory: [{name,version}]
+  loggedInUser String? // endpoint (tray) agent: current Windows user — input to the AAA / NAC step
+  posture    Json? // endpoint posture: { firewallOn, antivirusOn, diskEncrypted, pendingReboot, domainJoined } — for AAA
+  mode       String    @default("push") // push (agent→MCMF) | ssh-pull (MCMF→VM over SSH)
+  port       Int       @default(22) // ssh-pull port
+  active     Boolean   @default(true) // admin decommission → agent self-exits / pull stops
+  intervalSec Int      @default(60) // push: agent honors; ssh-pull: MCMF pull cadence
+  lastSeenAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  // Pure-outbound "tunnel" agents: they dial home over HTTPS (long-poll), so the server NEVER
+  // connects inbound. No listener/port needed. homeUrl = the server this agent was downloaded from.
+  outbound   Boolean   @default(false)
+  homeUrl    String    @default("") // https://<host> the agent reports to (env-aware: where it was downloaded)
+  lastPollAt DateTime? // last command long-poll — liveness of the outbound channel
+
+  commands   AgentCommand[]
+
+  @@index([resourceId])
+}
+
+// A command queued for an outbound agent. The agent long-polls GET /agent/commands, executes
+// locally, and POSTs the result back — all over its single outbound HTTPS connection (no inbound).
+model AgentCommand {
+  id          String    @id @default(cuid())
+  agentId     String
+  agent       Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  kind        String // run | power | config | update | console-open | console-close | console-data
+  payload     Json      @default("{}")
+  status      String    @default("queued") // queued | delivered | done | failed
+  result      String    @default("") // stdout / message / error from the agent
+  exitCode    Int? // for `run`
+  createdById String    @default("")
+  createdAt   DateTime  @default(now())
+  deliveredAt DateTime?
+  doneAt      DateTime?
+
+  @@index([agentId, status])
+}
+
+// SIEM / security-event store fed by agents, monitors, cloud findings, alerts.
+model SiemEvent {
+  id       String   @id @default(cuid())
+  ts       DateTime @default(now())
+  source   String // agent host / cloud / monitor / alerting
+  host     String?
+  level    String   @default("info") // info | warning | error | critical
+  category String   @default("system") // system | security | service | auth | network
+  message  String
+  raw      Json?
+
+  @@index([ts])
+}
+
+// Per-VM console credentials — password sealed with AES-256-GCM (APP_ENCRYPTION_KEY).
+model VmCredential {
+  id        String   @id @default(cuid())
+  userId    String   @default("") // owner — the vault is per-user
+  host      String
+  protocol  String // rdp | ssh | telnet | vnc
+  username  String
+  password  String // encrypted (AES-256-GCM) — blank when key-auth is used
+  privateKey String  @default("") // encrypted SSH private key (PEM) — key-auth for GCP/AWS/etc.
+  keyPassphrase String @default("") // encrypted passphrase for the private key (optional)
+  kind      String   @default("vm") // vm | firewall | router | switch | network | other
+  label     String   @default("") // optional friendly name
+  sharedWith String  @default("") // "" = owner only · "all" = every user · JSON userId array = selected users
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@unique([userId, host, protocol])
+}
+
+// Uploaded branding assets (logo / background) — kept out of the settings JSON, served by URL.
+model Asset {
+  id        String   @id @default(cuid())
+  mime      String
+  data      Bytes
+  createdAt DateTime @default(now())
+}
+
+model OrgSettings {
+  id           Int      @id @default(1)
+  orgName      String   @default("Acme Corp Cloud")
+  userName     String   @default("John Doe")
+  userEmail    String   @default("john.doe@acme.com")
+  userRole     String   @default("Cloud Administrator")
+  timezone     String   @default("UTC-05:00 Eastern Time")
+  dateFormat   String   @default("MM/DD/YYYY")
+  currency     String   @default("USD ($)")
+  language     String   @default("English (US)")
+  primaryColor String   @default("#3b82f6")
+  tagline      String   @default("Multi-Cloud Platform") // sidebar subtitle under the platform name
+  theme        String   @default("midnight") // appearance theme id (background + surfaces + accent)
+  logo         String   @default("") // logo: asset URL (/api/settings/asset/:id) or legacy data-URL
+  bgImage      String   @default("") // optional background image: asset URL or empty
+  fontScale    String   @default("base") // appearance: UI text size — sm | base | lg | xl
+  fontFamily   String   @default("system") // appearance: UI font stack id (system-safe, no downloads)
+  reduceMotion Boolean  @default(false) // appearance: disable animations/transitions (a11y + low-power)
+  highContrast Boolean  @default(false) // appearance: stronger borders + brighter muted text (a11y)
+  solidSurfaces Boolean @default(false) // appearance: drop panel translucency/blur (clarity + perf)
+  modules      Json     @default("{}") // module customization toggles
+  layout       Json     @default("{}") // order + per-role visibility (modules/widgets/help)
+  logRetentionDays Int  @default(90) // notification delivery log retention (compliance)
+  blocklistEnabled Boolean @default(false) // enforce the network/IP access blocklist
+  accessBlocklist  Json    @default("[]") // [{ type:'ip'|'cidr'|'range', value, note, enabled }]
+  countryMode      String  @default("off") // off | allow (only listed countries) | block (listed countries denied)
+  countryList      Json    @default("[]") // ISO-2 codes, e.g. ["US","IN"]
+  require2fa       Boolean @default(true) // force every user to enable 2FA before using the app
+  provisioningEnabled Boolean @default(false) // Advanced Cloud Integration: allow live create of VMs/resources
+  makerChecker     Boolean @default(false) // segregation of duties: a request can't be approved by its own requester
+  buildNumber      Int     @default(0) // CI/CD: monotonic build counter, bumped on each deploy/sync to a node
+  sourceManifest   Json    @default("{}") // CI/CD: last deploy's {file: hash} map — diffed to produce the changelog
+  // ── Operator-tunable system parameters (changeable in Settings → System Parameters, no redeploy) ──
+  monitorIntervalSec Int   @default(30)  // how often host/service monitors are probed
+  alertEvalSec       Int   @default(60)  // how often the alert engine evaluates rules
+  agentOfflineSec    Int   @default(300) // a guest agent is "offline" after no check-in for this long
+  agentRetentionDays Int   @default(14)  // stale guest agents (+ their auto resources) are pruned after this
+  approvalExpiryDays Int   @default(7)   // a pending approval request auto-expires after this
+  logTtlSettingDays  Int   @default(30)  // ClickHouse log store TTL (applied on log-store (re)init)
+  sessionTimeoutHours Int  @default(12)  // idle/session lifetime for a normal sign-in (not "remember me")
+  clusterCname String   @default("") // HA cluster CNAME / floating VIP that agents & clients target for failover
+  platformDomain  String @default("") // this server's public domain (one per deployment); blank = access by IP
+  platformTlsMode String @default("") // how HTTPS is provided for platformDomain: '' | letsencrypt | upload | upstream
+  envLabel     String   @default("production") // this server's environment role: development | production
+  backupExternalPath String @default("") // optional off-server backup dir (mount an NFS/network share here)
+  updatedAt    DateTime @updatedAt @default(now())
+}
+
+// HA cluster member (1 primary + up to 4 streaming read-replicas). Drives the Cluster panel,
+// per-node setup/promotion runbooks, and the IPs/CNAME agents fail over across.
+model ClusterNode {
+  id        String   @id @default(cuid())
+  name      String
+  host      String   @unique // IP or hostname
+  role      String   @default("replica") // primary | replica
+  subnet    String? // optional, for cross-subnet documentation
+  createdAt DateTime @default(now())
+
+  // SSH credentials for automated replica deployment (password sealed with APP_ENCRYPTION_KEY).
+  sshUser       String?
+  sshPort       Int     @default(22)
+  sshPassSealed String? // AES-256-GCM sealed SSH/sudo password — never returned to the client
+
+  // Auto-deploy lifecycle.
+  deployStatus    String    @default("none") // none | deploying | deployed | failed
+  deployStartedAt DateTime?
+  deployLog       String    @default("") // streamed progress, shown live in the panel
+  deployProgress  Int       @default(0) // 0-100 % for the live progress bar
+  lastSyncAt      DateTime? // last successful clone/re-sync of data + code from the primary
+  environment     String    @default("production") // development | test | production — drives the approval-gated sync
+  syncPaused      Boolean   @default(false) // operator "stop sync" — blocks deploy/sync to this node
+  lastDeployVersion String  @default("") // CI/CD: build version of the last successful deploy/sync to this node
+  lastDeploySource  String  @default("") // CI/CD: source server (host/IP) that pushed the last deploy
+  lastDeployAt      DateTime? // CI/CD: when the last code/version was deployed to this node
+  lastDeployHash    String  @default("") // CI/CD: content hash of the last-shipped source (skip rebuild if unchanged)
+}
+
+// CI/CD audit trail: one row per successful deploy/sync, written on BOTH the source and the target
+// (so the target — e.g. production — has a record of which build it received and from which server).
+model DeployRecord {
+  id          String   @id @default(cuid())
+  version     String // build version, e.g. "1.0.0+build.42"
+  kind        String   @default("config-sync") // config-sync | replica-deploy | resync
+  sourceHost  String   @default("") // the server that pushed (host/IP)
+  targetHost  String   @default("") // the server that received
+  targetName  String   @default("")
+  actorEmail  String   @default("")
+  status      String   @default("deployed") // deployed | failed
+  changes     String   @default("") // human changelog summary: feature areas + counts for this build
+  files       Json     @default("[]") // per-file change list: [{ p: path, c: '+'|'~'|'-' }]
+  createdAt   DateTime @default(now())
+}
+
+// Role-based access control. admin = full, operator = cloud ops (no user/billing
+// admin), viewer = read-only.
+enum Role {
+  admin
+  operator
+  viewer
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  contact       String    @default("")
+  role          Role      @default(viewer)
+  status        String    @default("active") // active | suspended
+  passwordHash  String    @default("")
+  lastLoginAt   DateTime?
+  // TOTP two-factor auth
+  totpEnabled   Boolean   @default(false)
+  totpSecret    String? // active base32 secret
+  totpPending   String? // secret during setup, before first verify
+  recoveryCodes Json      @default("[]") // sha256 hashes of one-time recovery codes
+  require2fa      Boolean   @default(false) // admin-set per-user MFA requirement (forces enrolment)
+  emailOtpHash    String? // sha256 of the active email one-time code (alternative second factor)
+  emailOtpExpires DateTime? // expiry of the email OTP
+  monitorGroups Json      @default("[]") // monitor groups this user may see ([] = all)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  memberships   GroupMembership[]
+}
+
+// User group / team — used for group-based notification targeting.
+model Group {
+  id          String            @id @default(cuid())
+  name        String
+  description String            @default("")
+  notifyVia   String            @default("email") // email | whatsapp | both
+  // Permission-based access: when governs=true, members' visible modules/widgets/help/pages are
+  // restricted to this policy (union across all the user's governing groups). admin role bypasses.
+  access      Json              @default("{}") // { governs, all, modules[], widgets[], help[], pages[] }
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  members     GroupMembership[]
+}
+
+model GroupMembership {
+  id      String @id @default(cuid())
+  groupId String
+  userId  String
+  group   Group  @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+}
+
+// Admin-managed integration credentials (SSO / SMTP / WhatsApp). Secrets stored
+// AES-256-GCM encrypted; applied to process.env at runtime so existing consumers work.
+model IntegrationSetting {
+  key       String   @id
+  value     String   @default("") // encrypted when secret=true
+  secret    Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+// Every notification delivery attempt (email / whatsapp / slack / webhook / pagerduty).
+model NotificationLog {
+  id           String   @id @default(cuid())
+  ts           DateTime @default(now())
+  channelId    String?
+  channelName  String
+  channelType  String
+  target       String
+  subject      String
+  status       String // sent | failed | retrying | gave_up
+  error        String?
+  attempts     Int      @default(1) // total send attempts (initial + retries)
+  firstTriedAt DateTime @default(now())
+  nextRetryAt  DateTime? // when the auto-retry runs next (null = no retry pending)
+  payload      Json? // { m, workflowName } captured so a failed send can be retried
+
+  @@index([ts])
+  @@index([nextRetryAt])
+}
+
+// Security audit trail: logins, failures, password/role/user changes.
+model AuditLog {
+  id          String   @id @default(cuid())
+  ts          DateTime @default(now())
+  action      String // login | login_failed | logout | password_changed | user_created | user_updated | user_deleted | password_reset
+  actorEmail  String   @default("")
+  actorId     String?
+  targetEmail String?
+  ip          String?
+  userAgent   String?
+  detail      String?
+
+  @@index([ts])
+}
+
+// Active login sessions — JWT carries this id (jti); revoking it invalidates the token.
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime
+  ip         String?
+  userAgent  String?
+  revokedAt  DateTime?
+
+  @@index([userId])
+}
+
+// One-time tokens for forgot-password and forgot-2FA flows.
+model PasswordReset {
+  id        String    @id @default(cuid())
+  userId    String
+  token     String    @unique
+  purpose   String    @default("password") // password | 2fa
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+// Governance policies (guardrails) — environment-scoped rules evaluated against resources.
+model Policy {
+  id             String    @id @default(cuid())
+  name           String
+  description    String    @default("")
+  category       String    @default("governance") // tagging | security | cost | region | environment
+  scopeEnv       String    @default("all") // all | production | staging | development | test | unknown
+  ruleKind       String // require_tag | required_tag_value | no_untagged | no_public_ip | allowed_regions | max_monthly_cost
+  ruleConfig     Json      @default("{}")
+  effect         String    @default("audit") // audit | alert
+  enabled        Boolean   @default(true)
+  lastEvalAt     DateTime?
+  checkedCount   Int       @default(0)
+  violationCount Int       @default(0)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+// Latest non-compliant resources per policy (recomputed each evaluation).
+model PolicyViolation {
+  id           String   @id @default(cuid())
+  policyId     String
+  resourceId   String
+  resourceName String
+  provider     Provider
+  environment  String
+  detail       String?
+  ts           DateTime @default(now())
+
+  @@index([policyId])
+}
+
+// Customizable reports over existing data sources (inventory/cost/security/compliance/violations).
+model Report {
+  id           String    @id @default(cuid())
+  name         String
+  description  String    @default("")
+  source       String    // resources | cost | security | compliance | violations
+  config       Json      @default("{}") // filters
+  format       String    @default("csv") // csv | json
+  schedule     String    @default("manual") // manual | daily | weekly
+  recipients   String    @default("") // comma-separated emails
+  lastRunAt    DateTime?
+  lastRowCount Int       @default(0)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+model ReportRun {
+  id       String   @id @default(cuid())
+  reportId String
+  ts       DateTime @default(now())
+  status   String // ok | error
+  rowCount Int      @default(0)
+  trigger  String   @default("manual") // manual | scheduled
+  detail   String?
+
+  @@index([reportId])
+}
+
+// Risky network/firewall rules found by a network scan (recomputed per scan, per provider).
+model NetworkRisk {
+  id           String   @id @default(cuid())
+  provider     Provider
+  resourceName String // NSG / security group / firewall name
+  ruleName     String
+  source       String
+  ports        String
+  protocol     String
+  severity     String // critical | high | medium | low
+  detail       String
+  ts           DateTime @default(now())
+
+  @@index([provider])
+}
+
+// Which actions require approval before execution.
+model ApprovalPolicy {
+  id               String   @id @default(cuid())
+  action           String   @unique // vm_stop | vm_reboot | vm_start | connection_delete
+  label            String
+  requiresApproval Boolean  @default(true)
+  autoApproveAdmin Boolean  @default(true) // admins execute directly
+  updatedAt        DateTime @updatedAt
+}
+
+// FinOps spend budget — actual spend is computed live from resources/connections.
+model Budget {
+  id         String   @id @default(cuid())
+  name       String
+  scope      String   @default("all") // all | provider | environment | account | service
+  scopeValue String   @default("") // e.g. "aws", "production", account name, service
+  amount     Float // budget ceiling for the period
+  period     String   @default("monthly")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt @default(now())
+}
+
+// A pending/decided request to perform a guarded action.
+model ApprovalRequest {
+  id               String    @id @default(cuid())
+  action           String
+  title            String
+  resourceRef      String?
+  resourceName     String?
+  payload          Json      @default("{}")
+  status           String    @default("pending") // pending | approved | rejected | executed | failed | expired
+  requestedById    String
+  requestedByEmail String
+  approverEmail    String?
+  decidedAt        DateTime?
+  decisionNote     String?
+  result           String?
+  phase            String? // failed deploys: which step failed (e.g. "Resource group create")
+  remediation      String? // failed deploys: what to do to succeed
+  retries          Int       @default(0)
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+
+  @@index([status])
+}
+
+// Managed domain — HTTPS (Let's Encrypt cert) and/or email sending (DKIM + SPF + DMARC).
+model Domain {
+  id            String    @id @default(cuid())
+  domain        String    @unique
+  // HTTPS (Let's Encrypt) — tracked here; the cert itself lives in nginx's cert dir.
+  httpsEnabled  Boolean   @default(false)
+  certExpiry    DateTime?
+  // Email sending (DKIM). dkimPrivate is an encrypted PEM; dkimPublic is the base64 DNS value.
+  emailEnabled  Boolean   @default(false)
+  emailFrom     String    @default("") // e.g. notifications@domain
+  dkimSelector  String    @default("mcmf")
+  dkimPrivate   String?
+  dkimPublic    String?
+  emailVerified Boolean   @default(false)
+  active        Boolean   @default(false) // the active sending domain — signs outgoing mail with its DKIM
+  createdAt     DateTime  @default(now())
+}
+
+// Service Catalog provisioning request — one Terraform plan->apply lifecycle run via the tf-runner.
+model ProvisionJob {
+  id           String   @id @default(cuid())
+  template     String // catalog template key
+  title        String   @default("")
+  cloud        String   @default("demo") // demo | aws | azure | gcp
+  connectionId String? // cloud connection whose creds are used (null for the credential-free demo)
+  inputs       Json     @default("{}")
+  estCostMonthly Float  @default(0) // FinOps rough monthly USD estimate computed at plan time
+  costNote     String   @default("")
+  status       String   @default("planned") // planned | plan_failed | pending_apply | applying | applied | apply_failed | destroyed
+  planLog      String   @default("")
+  applyLog     String   @default("")
+  outputs      Json     @default("{}")
+  requestedBy  String   @default("")
+  approvedBy   String   @default("")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// ── Replication / DR orchestration ───────────────────────────────────────────
+// A replication set pairs a PRIMARY VM with a SECONDARY (and optional TERTIARY) in another cloud for
+// application/database HA. MCMF is the control + status plane; the actual replication runs over SSH
+// (file: rsync) and reports here. mode: sync | async | scheduled. state: which side is live.
+model ReplicationSet {
+  id            String    @id @default(cuid())
+  name          String
+  dataType      String    @default("files") // files | database
+  mode          String    @default("scheduled") // sync | async | scheduled
+  primaryId     String // Resource id (Inventory)
+  primaryHost   String    @default("")
+  primaryName   String    @default("")
+  secondaryId   String
+  secondaryHost String    @default("")
+  secondaryName String    @default("")
+  tertiaryId    String    @default("")
+  tertiaryHost  String    @default("")
+  tertiaryName  String    @default("")
+  sourcePath    String    @default("") // files: source dir; database: db name
+  targetPath    String    @default("") // files: target dir
+  dbEngine      String    @default("postgres") // database: postgres | mysql
+  dbName        String    @default("") // database name to replicate
+  dbUser        String    @default("") // db user (blank = OS/peer auth)
+  dbPassword    String    @default("") // encrypted db password (blank = peer/socket auth)
+  dockerVolumes String    @default("") // docker: comma/space-separated named volumes to replicate
+  blockDevice   String    @default("") // block(DRBD): backing device on the PRIMARY (e.g. /dev/sdb or /dev/vg0/lv)
+  blockDeviceB  String    @default("") // block(DRBD): backing device on the SECONDARY (blank = same path as primary)
+  drbdPort      Int       @default(7789) // block(DRBD): replication TCP port
+  drbdMinor     Int       @default(0) // block(DRBD): /dev/drbd<minor>
+  drbdMount     String    @default("") // block(DRBD): optional mount point for /dev/drbd<minor> after promote
+  driver        String    @default("orchestrated") // orchestrated (MCMF SSHes) | agent (installed agent runs it locally)
+  intervalMin   Int       @default(15) // scheduled cadence (minutes)
+  intervalSec   Int       @default(0) // near-sync: when mode=sync and >0, run every N seconds (min 10)
+  enabled       Boolean   @default(true)
+  status        String    @default("idle") // idle | running | healthy | lagging | failed | paused
+  state         String    @default("primary-active") // primary-active | failed-over | tertiary-active
+  lastRunAt     DateTime?
+  lastOkAt      DateTime?
+  lastError     String    @default("")
+  lagSeconds    Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  runs          ReplicationRun[]
+}
+
+model ReplicationRun {
+  id         String         @id @default(cuid())
+  setId      String
+  set        ReplicationSet @relation(fields: [setId], references: [id], onDelete: Cascade)
+  direction  String         @default("p2s") // p2s | p2t | s2t (which hop)
+  startedAt  DateTime       @default(now())
+  finishedAt DateTime?
+  ok         Boolean        @default(false)
+  durationMs Int            @default(0)
+  detail     String         @default("")
+
+  @@index([setId])
+}
+
+// Standalone replication agent installed on a primary/secondary host. The agent polls MCMF for the jobs
+// where its host is the active source, runs the engine locally (rsync/dump/docker), and reports status.
+// MCMF is status-only for agent-driven sets (its own SSH scheduler skips them).
+model ReplicationAgent {
+  id         String    @id @default(cuid())
+  host       String    @unique // the VM host/ip this agent runs on (matches ReplicationSet.*Host)
+  key        String    @unique // shared secret the agent presents on check-in / report
+  os         String    @default("") // linux | windows (reported)
+  version    String    @default("")
+  hostname   String    @default("") // os hostname (reported, informational)
+  enabled    Boolean   @default(true)
+  pubKey     String    @default("") // agent's SSH public key (for key-auth push; provisioned onto targets)
+  provisioned String   @default("") // comma-separated target hosts we've installed pubKey on
+  lastSeenAt DateTime?
+  lastIp     String    @default("")
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+// Cross-cloud VPN link (IPsec / strongSwan). MCMF brokers a PSK and configures swanctl on both peers
+// (or just side A when the far side is an external gateway), brings the tunnel up, and reports status.
+// Gives replication a private, encrypted path between clouds/sites. Cloud route-tables stay the user's job.
+model VpnLink {
+  id          String    @id @default(cuid())
+  name        String
+  tech        String    @default("ipsec") // ipsec (strongSwan)
+  manage      String    @default("auto") // auto (MCMF configures VM endpoints) | monitor (gateways set up externally; MCMF only monitors)
+  mode        String    @default("site-to-site") // site-to-site | host-to-host
+  ikeVersion  String    @default("ikev2")
+  aManual     Boolean   @default(false) // side A is an external gateway (not MCMF-managed)
+  vpnConnId   String    @default("") // cloud VPN connection id for authoritative API status (e.g. AWS vpn-0abc)
+  statusSource String   @default("") // how status was read: probe | aws-api
+  monitorHost String    @default("") // SSH-reachable host to run the tunnel probe FROM
+  monitorTarget String  @default("") // an IP on the far side to reach THROUGH the tunnel
+  monitorPorts String   @default("") // comma-separated TCP ports to test across the tunnel
+  monitorUp   Boolean   @default(false)
+  monitorResult String  @default("") // last probe/api detail (ping + per-port)
+  lastMonitorAt DateTime?
+  peerType    String    @default("strongswan") // remote gateway type/vendor: strongswan|aws|azure|gcp|cisco-asa|cisco-ios|fortinet|paloalto|pfsense|mikrotik|sophos|checkpoint|generic
+  ikeProposal String    @default("") // negotiated IKE proposals (vendor-compatible preset)
+  espProposal String    @default("") // negotiated ESP/child proposals
+  aId         String    @default("") // VM A resource id (Inventory)
+  aName       String    @default("")
+  aProvider   String    @default("") // aws | azure | gcp | private (auto-detected)
+  aHost       String    @default("") // A public/reachable IP (IKE endpoint)
+  aSubnet     String    @default("") // A local subnet (site-to-site) e.g. 10.0.0.0/24 (auto-populated)
+  bManual     Boolean   @default(false) // B is an external gateway (no MCMF creds / not configured by MCMF)
+  bId         String    @default("")
+  bName       String    @default("")
+  bProvider   String    @default("") // aws | azure | gcp | private | onprem (cloud VM)
+  bDevice     String    @default("") // on-prem/gateway device label (e.g. FortiGate 100F, on-prem firewall)
+  bHost       String    @default("") // B public IP / gateway
+  bSubnet     String    @default("") // B remote subnet
+  psk         String    @default("") // encrypted pre-shared key
+  status      String    @default("idle") // idle | up | down | error
+  lastError   String    @default("")
+  lastStatus  String    @default("") // last swanctl --list-sas summary
+  lastCheckAt DateTime?
+  enabled     Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+// Turnkey cross-cloud network fabric: one governed, staged pipeline that provisions a network (VPC/VNet
+// + subnet) and a site-to-site VPN gateway + connection in EACH of two clouds via provider APIs, exchanges
+// the assigned gateway public IPs, wires both connections with a shared key, and hands the result off to
+// the VPN monitor. Must be ARMED (approved) before it provisions billable resources.
+model NetworkFabric {
+  id          String   @id @default(cuid())
+  name        String
+  status      String   @default("draft") // draft | provisioning | connecting | monitoring | up | error
+  armed       Boolean  @default(false)   // approval gate — no billable resource is created until armed
+  stage       String   @default("net_a") // net_a|net_b|gw_a|gw_b|conn_a|conn_b|handoff|done
+  // side A
+  aProvider   String   @default("")      // aws | azure | gcp
+  aRegion     String   @default("")
+  aCidr       String   @default("10.10.0.0/16")
+  aSubnetCidr String   @default("10.10.0.0/24")
+  aNetworkId  String   @default("")      // resulting VPC/VNet id
+  aGatewayId  String   @default("")      // resulting VPN gateway id
+  aGatewayIp  String   @default("")      // resulting gateway public IP
+  aConnId     String   @default("")      // resulting connection/tunnel id
+  // side B
+  bProvider   String   @default("")
+  bRegion     String   @default("")
+  bCidr       String   @default("10.20.0.0/16")
+  bSubnetCidr String   @default("10.20.0.0/24")
+  bNetworkId  String   @default("")
+  bGatewayId  String   @default("")
+  bGatewayIp  String   @default("")
+  bConnId     String   @default("")
+  psk         String   @default("")      // encrypted shared key
+  vpnLinkId   String   @default("")      // handed-off monitor VpnLink id
+  steps       Json     @default("[]")    // [{stage,status,detail,at}]
+  lastError   String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

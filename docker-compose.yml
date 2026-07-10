@@ -1,0 +1,191 @@
+services:
+  db:
+    image: postgres:16
+    container_name: mcmf-std-db
+    environment:
+      POSTGRES_USER: mcmf
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mcmf}
+      POSTGRES_DB: mcmf
+    # No published port — DB is only reachable inside the compose network (hardening).
+    volumes:
+      - mcmf-std-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcmf -d mcmf"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: mcmf-std-api
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://mcmf:mcmf@db:5432/mcmf}
+      PORT: "4000"
+      # Comma-separated allowed browser origins for CORS.
+      WEB_ORIGIN: ${WEB_ORIGIN:-https://localhost}
+      # Production: 1 = accept the UI from ANY network/origin (reflects the request origin).
+      ALLOW_ALL_ORIGINS: ${ALLOW_ALL_ORIGINS:-0}
+      # Seal key for stored cloud credentials (AES-256-GCM) + JWT signing. REQUIRED — no default.
+      # Generate a strong, STABLE value once: `openssl rand -hex 32` (put it in .env). The API
+      # refuses to start without it (rotating it invalidates every stored cloud connection).
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?set APP_ENCRYPTION_KEY in .env — run: openssl rand -hex 32}
+      # DEMO_SEED=0 (default) → clean install, no sample data. Set DEMO_SEED=1 to load the demo dataset.
+      DEMO_SEED: ${DEMO_SEED:-0}
+      # SMTP for the email notification channel (optional — email skipped if SMTP_HOST unset).
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      # SSO (OAuth) — optional; set per the Help → Integrations guide to enable.
+      SSO_BASE_URL: ${SSO_BASE_URL:-https://localhost}
+      SSO_AUTO_PROVISION: ${SSO_AUTO_PROVISION:-0}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      MS_CLIENT_ID: ${MS_CLIENT_ID:-}
+      MS_CLIENT_SECRET: ${MS_CLIENT_SECRET:-}
+      MS_TENANT: ${MS_TENANT:-common}
+      # WhatsApp (Meta Cloud API) — optional; for WhatsApp alert notifications.
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID:-}
+      # Clouds allowed to EXECUTE live provisioning on approval (else governance-only).
+      PROVISION_EXEC: ${PROVISION_EXEC:-}
+      # Apache Guacamole daemon for the in-browser RDP/SSH/telnet console.
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+      # Guest-agent ingest key (machine-to-machine). Defaults to a stable value if unset.
+      AGENT_KEY: ${AGENT_KEY:-}
+      # AI assistant / RCA (Anthropic Claude) — optional; also settable in Settings → Integrations.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-claude-sonnet-4-6}
+      # AI chat is the built-in MCMF native assistant (instant, on-prem, no model). Setting a cloud
+      # AI key (above) optionally powers richer free-form analysis/RCA narratives.
+      AI_PROVIDER: ${AI_PROVIDER:-free}
+      # ClickHouse log database — fast log search/aggregation, synced from Postgres with a TTL.
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+      LOG_TTL_DAYS: ${LOG_TTL_DAYS:-30}
+      # Terraform runner microservice — the isolated worker that executes Service Catalog provisioning.
+      TF_RUNNER_URL: ${TF_RUNNER_URL:-http://tf-runner:8080}
+    ports:
+      # Loopback-only: reachable for on-host debugging, NOT exposed on the network. The UI talks
+      # to the API through the nginx TLS proxy (/api), never this port directly.
+      - "127.0.0.1:4000:4000"
+    volumes:
+      # Mount the host Docker socket so the "local Docker" connector can reach the engine.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared backup volume — the Database panel lists backups and can trigger pg_dump on demand.
+      - mcmf-backups:/backups
+      # The platform's own source (read-only) so HA auto-deploy can ship an exact copy of what's
+      # running to a new replica over SSH — no GitHub access/token needed.
+      - ./:/opt/mcmf-src:ro
+      # TLS cert dir (same one nginx serves) so Settings → TLS can read status, regenerate the
+      # cert, and offer the cert + auto-install script for download. nginx reloads via the socket.
+      - ${CERT_DIR:-/home/mcmf/mcmf-certs}:/etc/nginx/certs
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ClickHouse — dedicated log-analytics database for fast log search/aggregation. Synced from
+  # Postgres (event/siem/audit) with a TTL; surfaced in Settings → Database alongside Postgres.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: mcmf-std-clickhouse
+    environment:
+      CLICKHOUSE_DB: mcmf
+      CLICKHOUSE_SKIP_USER_SETUP: "1" # default user, no password — not published outside the compose net
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    # 4 GiB ceiling (host has ample RAM); ClickHouse itself is capped to 3 GiB via low-mem.xml so it
+    # self-limits instead of being OOM-killed (it otherwise sizes memory from the host's RAM, not the
+    # cgroup, and over-commits → exit 137 restart loop).
+    mem_limit: 4g
+    volumes:
+      - mcmf-clickhouse:/var/lib/clickhouse
+      - ./clickhouse/low-mem.xml:/etc/clickhouse-server/config.d/low-mem.xml:ro
+    restart: unless-stopped
+
+  # Apache Guacamole daemon — translates RDP/VNC/SSH/telnet to the browser canvas.
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: mcmf-std-guacd
+    restart: unless-stopped
+
+  # Terraform runner — isolated provisioning worker (Service Catalog). Capped CPU/RAM + a concurrency
+  # limit so a heavy `apply` can't affect api/web. No published port — only the api calls it.
+  tf-runner:
+    build:
+      context: ./tf-runner
+      dockerfile: Dockerfile
+    container_name: mcmf-std-tf-runner
+    environment:
+      MAX_CONCURRENT: ${TF_MAX_CONCURRENT:-2}
+    mem_limit: 1g
+    cpus: 1.5
+    volumes:
+      - mcmf-tf-work:/work
+      - mcmf-tf-plugins:/plugins
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        # Same-origin via the nginx proxy → relative /api (no CORS, no mixed content).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+    container_name: mcmf-std-web
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+    # No published port — reachable only through nginx.
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # TLS-terminating reverse proxy: single HTTPS origin in front of web + api.
+  nginx:
+    image: nginx:alpine
+    container_name: mcmf-std-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${CERT_DIR:-/home/mcmf/mcmf-certs}:/etc/nginx/certs:ro
+    depends_on:
+      - web
+      - api
+    restart: unless-stopped
+
+  # Daily Postgres backup (runs once on start, then every 24h; keeps the last 7).
+  backup:
+    image: postgres:16
+    container_name: mcmf-std-backup
+    environment:
+      PGPASSWORD: mcmf
+    volumes:
+      - mcmf-backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        mkdir -p /backups
+        while true; do
+          f=/backups/mcmf-$(date +%Y%m%d-%H%M%S).sql.gz
+          if pg_dump -h db -U mcmf -d mcmf | gzip > "$$f"; then echo "backup ok: $$f"; else echo "backup FAILED"; rm -f "$$f"; fi
+          ls -1t /backups/mcmf-*.sql.gz 2>/dev/null | tail -n +8 | xargs -r rm -f
+          sleep 86400
+        done
+    restart: unless-stopped
+
+volumes:
+  mcmf-std-db:
+  mcmf-backups:
+  mcmf-clickhouse:
+  mcmf-tf-work:
+  mcmf-tf-plugins:

@@ -1,0 +1,131 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  /* Theme tokens (RGB triplets) — overridden at runtime from Appearance settings (themes). */
+  --brand-rgb: 59 130 246;
+  --brand-soft-rgb: 29 78 216;
+  --bg-rgb: 7 10 18;
+  --panel-rgb: 13 19 32;
+  --card-rgb: 17 24 39;
+  --card-hover-rgb: 22 31 51;
+  --border-rgb: 30 41 59;
+  --border-soft-rgb: 26 35 54;
+  --muted-rgb: 100 116 139;
+  --muted-light-rgb: 148 163 184;
+  --text-rgb: 226 232 240;
+  --fg-rgb: 255 255 255; /* primary foreground (text-white) — flips to dark in light/day mode */
+  /* Appearance: text size + font — overridden at runtime from Appearance settings (lib/branding.ts). */
+  --font-scale: 1;
+  --app-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* Text size: scale the root font-size so all rem-based (Tailwind text-*) sizing follows proportionally. */
+html {
+  font-size: calc(100% * var(--font-scale, 1));
+}
+html,
+body {
+  font-family: var(--app-font);
+}
+
+/* Advanced — Reduce motion: kill transitions/animations app-wide (accessibility + low-power devices). */
+html[data-motion='reduced'] *,
+html[data-motion='reduced'] *::before,
+html[data-motion='reduced'] *::after {
+  transition-duration: 0.001ms !important;
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  scroll-behavior: auto !important;
+}
+
+/* Advanced — Solid panels: drop the translucency + blur on cards (clarity + GPU savings). */
+html[data-surfaces='solid'] .card {
+  background-color: rgb(var(--card-rgb)) !important;
+  backdrop-filter: none !important;
+}
+
+/* Solid accent / semantic backgrounds keep white text for contrast in every theme (incl. day mode).
+   Only full-opacity classes are targeted, so translucent chips like bg-brand/10 keep their own text. */
+.bg-brand,
+.bg-brand-soft,
+.bg-success,
+.bg-danger,
+.bg-warning,
+.bg-info,
+.bg-purple {
+  color: #fff;
+}
+
+html,
+body {
+  background-color: rgb(var(--bg-rgb));
+  color: rgb(var(--text-rgb));
+  background-image: var(--bg-image, none);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+
+/* ── Mobile / PWA ───────────────────────────────────────────────────────── */
+/* Respect the home-bar / notch on phones (bottom tab bar uses this). env() is 0 on desktop. */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+/* When launched as an installed app, shift content below the status bar / notch. */
+@media (display-mode: standalone) {
+  body {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+}
+/* Snappier taps: no 300ms delay, no tap-highlight flash, no text auto-zoom on inputs. */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px; /* iOS won't auto-zoom the page when a field ≥16px is focused */
+  }
+}
+
+* {
+  border-color: rgb(var(--border-rgb));
+}
+
+/* Thin custom scrollbars to match the active theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--border-rgb));
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--muted-rgb));
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-border bg-card/80 backdrop-blur-sm;
+  }
+  .card-pad {
+    @apply p-4;
+  }
+  .panel-title {
+    @apply text-sm font-semibold text-slate-200;
+  }
+  .stat-value {
+    @apply text-2xl font-semibold tracking-tight text-white;
+  }
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-2xs font-medium;
+  }
+}

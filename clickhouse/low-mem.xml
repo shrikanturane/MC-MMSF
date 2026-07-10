@@ -1,0 +1,12 @@
+<clickhouse>
+    <!--
+      Cap ClickHouse's total memory BELOW the container mem_limit so it self-limits (rejects/queues
+      a heavy query) instead of being OOM-killed by the cgroup. ClickHouse otherwise sizes
+      max_server_memory_usage from the HOST's RAM (15 GiB), not its 2-4 GiB cgroup, so it
+      over-commits and the kernel kills it (exit 137) in a restart loop. 3 GiB cap under a 4 GiB
+      container limit leaves headroom. mark cache trimmed from the 5 GiB default; this is a
+      log-search store (append + scan), so the uncompressed cache isn't needed.
+    -->
+    <max_server_memory_usage>3221225472</max_server_memory_usage>
+    <mark_cache_size>536870912</mark_cache_size>
+</clickhouse>

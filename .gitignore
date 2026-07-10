@@ -1,0 +1,36 @@
+node_modules
+dist
+.next
+*.log
+.DS_Store
+
+# Secrets & environment — NEVER commit real cloud-connection credentials.
+# Cloud connection secrets/user-ids are stored encrypted (AES-256-GCM) in the Postgres
+# volume at runtime, not in the repo. These rules keep any local secret files out of git.
+.env
+.env.local
+.env.production
+.env.development
+.env.*.local
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+credentials.json
+service-account*.json
+secrets.*
+*.secret
+
+# Local build / deploy artifacts
+*.tar
+*.b64
+_*.b64
+vsfix.tar
+
+# stray root-level scratch scripts
+/_*.js
+
+# Test coverage reports
+coverage

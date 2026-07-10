@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="MCMF">
+  <defs>
+    <linearGradient id="mbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1320"/>
+      <stop offset="1" stop-color="#070a12"/>
+    </linearGradient>
+    <linearGradient id="mmark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <!-- full-bleed background; content kept within the central 80% safe zone for maskable -->
+  <rect width="512" height="512" fill="url(#mbg)"/>
+  <path d="M188 296a52 52 0 0 1 8-104 76 76 0 0 1 144 16 47 47 0 0 1-11 92H196a40 40 0 0 1-8-4z" fill="url(#mmark)"/>
+  <text x="256" y="384" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="92" font-weight="800" fill="#e2e8f0" letter-spacing="1">MCMF</text>
+</svg>
