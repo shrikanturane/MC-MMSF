@@ -129,9 +129,20 @@ export class AuthController {
   async ssoCallback(@Param('provider') provider: string, @Query('code') code: string, @Query('state') state: string, @Req() req: any, @Res() res: Response) {
     try {
       const { token } = await this.service.ssoLogin(provider, code, state, meta(req));
-      res.redirect(`${ssoBaseUrl()}/?token=${token}`);
+      // Hand the token to the SPA via a short-lived one-time code, NOT in the URL (avoids leaking
+      // the session token through browser history / Referer / proxy access logs).
+      const handoff = await this.service.issueSsoCode(token);
+      res.redirect(`${ssoBaseUrl()}/?sso_code=${handoff}`);
     } catch (e) {
       res.redirect(`${ssoBaseUrl()}/?sso_error=${encodeURIComponent((e as Error).message)}`);
     }
+  }
+
+  // SPA exchanges the one-time SSO code from the callback URL for the actual session token.
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @Public()
+  @Post('sso/exchange')
+  ssoExchange(@Body() body: { code?: string }) {
+    return this.service.exchangeSsoCode(body?.code);
   }
 }

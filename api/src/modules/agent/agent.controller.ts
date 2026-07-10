@@ -18,10 +18,12 @@ export class AgentController {
 
   // ── Outbound command channel (agent dials home over HTTPS — no inbound ports) ──
   // Agent long-polls for queued commands (key-authenticated). Held ~25s server-side.
+  // Prefer the x-agent-key HEADER (keeps the key out of access logs); the ?k= query stays
+  // supported so already-enrolled agents don't break.
   @Public()
   @Get('commands')
-  longPoll(@Query('agentId') agentId: string, @Query('k') k: string, @Headers('host') host: string) {
-    return this.service.longPollCommands(agentId, k, host);
+  longPoll(@Query('agentId') agentId: string, @Query('k') k: string, @Headers('x-agent-key') hk: string, @Headers('host') host: string) {
+    return this.service.longPollCommands(agentId, hk || k, host);
   }
 
   // Agent posts a command result back over the same outbound channel.

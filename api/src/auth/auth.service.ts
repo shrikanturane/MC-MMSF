@@ -29,10 +29,32 @@ const MAX_IP_FAILS = 20;
 @Injectable()
 export class AuthService {
   private readonly log = new Logger('Auth');
-  // In-memory brute-force tracker (single instance). Keyed by `${ip}|${email}`.
-  private readonly attempts = new Map<string, { fails: number; first: number; lockedUntil: number }>();
-  // Per-IP spray tracker keyed by ip.
-  private readonly ipAttempts = new Map<string, { fails: number; first: number; lockedUntil: number }>();
+
+  // ── DB-backed brute-force throttle (holds across HA replicas) ──────────────────────
+  /** Highest active lockout (ms epoch) for this account key or IP; 0 if not locked. */
+  private async throttleLockedUntil(acctKey: string, ip: string, now: number): Promise<number> {
+    const rows = await this.prisma.loginThrottle
+      .findMany({ where: { key: { in: [`acct:${acctKey}`, `ip:${ip}`] } } })
+      .catch(() => [] as { lockedUntil: Date | null }[]);
+    let until = 0;
+    for (const r of rows) if (r.lockedUntil && r.lockedUntil.getTime() > now) until = Math.max(until, r.lockedUntil.getTime());
+    return until;
+  }
+  /** Record one failure in the rolling window; returns the running fail count. Locks at maxFails. */
+  private async throttleBump(key: string, maxFails: number, now: number): Promise<number> {
+    const r = await this.prisma.loginThrottle.findUnique({ where: { key } }).catch(() => null);
+    const within = !!r && now - r.firstAt.getTime() < FAIL_WINDOW_MS;
+    const fails = (within ? r!.fails : 0) + 1;
+    const lockedUntil = fails >= maxFails ? new Date(now + LOCK_MS) : within ? (r?.lockedUntil ?? null) : null;
+    await this.prisma.loginThrottle
+      .upsert({
+        where: { key },
+        update: { fails, lockedUntil, ...(within ? {} : { firstAt: new Date(now) }) },
+        create: { key, fails, firstAt: new Date(now), lockedUntil },
+      })
+      .catch(() => undefined);
+    return fails;
+  }
 
   constructor(
     private readonly prisma: PrismaService,
@@ -45,11 +67,10 @@ export class AuthService {
     const key = `${ip}|${e}`;
     const now = Date.now();
 
-    const rec = this.attempts.get(key);
-    const ipRec = this.ipAttempts.get(ip);
-    if ((rec && rec.lockedUntil > now) || (ipRec && ipRec.lockedUntil > now)) {
-      const until = Math.max(rec?.lockedUntil ?? 0, ipRec?.lockedUntil ?? 0);
-      const mins = Math.ceil((until - now) / 60000);
+    // DB-backed lockout so the counter holds across HA API replicas (was per-instance in-memory).
+    const lockedUntil = await this.throttleLockedUntil(key, ip, now);
+    if (lockedUntil > now) {
+      const mins = Math.ceil((lockedUntil - now) / 60000);
       await this.audit.record({ action: 'login_failed', actorEmail: e || '(blank)', ip: meta.ip, userAgent: meta.userAgent, detail: 'locked out (too many attempts)' });
       throw new HttpException(`Too many failed attempts. Try again in ${mins} minute${mins > 1 ? 's' : ''}.`, HttpStatus.TOO_MANY_REQUESTS);
     }
@@ -57,25 +78,19 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({ where: { email: e } });
     if (!user || user.status !== 'active' || !verifyPassword(password || '', user.passwordHash)) {
       // Count the failure within the rolling window (per-account + per-IP).
-      const base = rec && now - rec.first < FAIL_WINDOW_MS ? rec : { fails: 0, first: now, lockedUntil: 0 };
-      base.fails += 1;
-      if (base.fails >= MAX_FAILS) base.lockedUntil = now + LOCK_MS;
-      this.attempts.set(key, base);
-      const ipBase = ipRec && now - ipRec.first < FAIL_WINDOW_MS ? ipRec : { fails: 0, first: now, lockedUntil: 0 };
-      ipBase.fails += 1;
-      if (ipBase.fails >= MAX_IP_FAILS) ipBase.lockedUntil = now + LOCK_MS;
-      this.ipAttempts.set(ip, ipBase);
+      const fails = await this.throttleBump(`acct:${key}`, MAX_FAILS, now);
+      await this.throttleBump(`ip:${ip}`, MAX_IP_FAILS, now);
       await this.audit.record({
         action: 'login_failed',
         actorEmail: e || '(blank)',
         ip: meta.ip,
         userAgent: meta.userAgent,
-        detail: `${!user ? 'no such user' : user.status !== 'active' ? 'account suspended' : 'bad password'} (${base.fails}/${MAX_FAILS})`,
+        detail: `${!user ? 'no such user' : user.status !== 'active' ? 'account suspended' : 'bad password'} (${fails}/${MAX_FAILS})`,
       });
       throw new UnauthorizedException('invalid email or password');
     }
-    // Success — clear the brute-force counter.
-    this.attempts.delete(key);
+    // Success — clear the brute-force counter for this account.
+    await this.prisma.loginThrottle.deleteMany({ where: { key: `acct:${key}` } }).catch(() => undefined);
 
     // Second factor required → hand back a short-lived challenge instead of a session.
     if (user.totpEnabled) {
@@ -200,6 +215,23 @@ export class AuthService {
     }
     if (user.status !== 'active') throw new UnauthorizedException('account suspended');
     return this.issueSession(user, meta, false, `sso:${p}`);
+  }
+
+  /** Store a session token behind a short-lived, single-use code so the SSO callback can hand it to
+   *  the SPA WITHOUT putting the token in a redirect URL (no leak via history / Referer / access logs). */
+  async issueSsoCode(token: string): Promise<string> {
+    const code = randomBytes(24).toString('base64url');
+    await this.prisma.ssoHandoff.create({ data: { code, token, expiresAt: new Date(Date.now() + 120_000) } });
+    return code;
+  }
+  /** Exchange a one-time SSO code for its session token (single use; rejects unknown/expired). */
+  async exchangeSsoCode(code?: string): Promise<{ token: string }> {
+    const c = (code || '').trim();
+    if (!c) throw new UnauthorizedException('missing sso code');
+    const row = await this.prisma.ssoHandoff.findUnique({ where: { code: c } });
+    if (row) await this.prisma.ssoHandoff.delete({ where: { code: c } }).catch(() => undefined);
+    if (!row || row.expiresAt.getTime() < Date.now()) throw new UnauthorizedException('invalid or expired sso code');
+    return { token: row.token };
   }
 
   private async consumeRecovery(userId: string, code: string): Promise<boolean> {

@@ -761,6 +761,25 @@ model PasswordReset {
   createdAt DateTime  @default(now())
 }
 
+// Brute-force throttle — DB-backed so the login lockout holds across HA API replicas
+// (was in-memory / per-instance). One row per account key ("acct:<ip>|<email>") and per IP ("ip:<ip>").
+model LoginThrottle {
+  key         String    @id
+  fails       Int       @default(0)
+  firstAt     DateTime  @default(now())
+  lockedUntil DateTime?
+  updatedAt   DateTime  @updatedAt
+}
+
+// Short-lived, single-use SSO hand-off code — lets the callback deliver the session token to the
+// SPA WITHOUT putting it in a redirect URL (avoids token leakage via history / Referer / logs).
+model SsoHandoff {
+  code      String   @id
+  token     String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
 // Governance policies (guardrails) — environment-scoped rules evaluated against resources.
 model Policy {
   id             String    @id @default(cuid())

@@ -56,9 +56,12 @@ async function bootstrap() {
   // (server-to-server with the x-agent-key) is not subject to CORS and is already accepted from any
   // network on this 0.0.0.0 listener.
   const allowAllOrigins = ['1', 'true', 'yes'].includes(String(process.env.ALLOW_ALL_ORIGINS ?? '').toLowerCase());
+  // Auth is a Bearer token in localStorage (never an ambient cookie), so credentialed CORS is
+  // unnecessary. When reflecting ANY origin (ALLOW_ALL_ORIGINS, used by HA replicas), do NOT set
+  // credentials — reflecting arbitrary origins WITH credentials is the footgun; without it there is none.
   app.enableCors({
     origin: allowAllOrigins ? true : (process.env.WEB_ORIGIN?.split(',') ?? ['http://localhost:3000']),
-    credentials: true,
+    credentials: !allowAllOrigins,
   });
   const port = Number(process.env.PORT ?? 4000);
   await app.listen(port, '0.0.0.0');

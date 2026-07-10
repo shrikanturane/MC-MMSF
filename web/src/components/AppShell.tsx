@@ -35,14 +35,27 @@ export function AppShell({ children }: { children: ReactNode }) {
   // Close the mobile nav drawer whenever the route changes.
   useEffect(() => { setNavOpen(false); }, [pathname]);
 
-  // SSO callback lands here as /?token=…  → store it, clean the URL, reload authenticated.
+  // SSO callback lands here as /?sso_code=…  → exchange it for the session token (POST, so the
+  // token never appears in a URL), store it, then land on the app. Legacy /?token= still honored.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const t = params.get('token');
+    const code = params.get('sso_code');
     if (t) {
       setExchanging(true);
       setToken(t);
-      window.location.replace('/topology'); // SSO sign-in lands on the topology
+      window.location.replace('/topology');
+    } else if (code) {
+      setExchanging(true);
+      fetch('/api/auth/sso/exchange', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }) })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error('sso exchange failed'))))
+        .then((d: { token: string }) => {
+          setToken(d.token);
+          window.location.replace('/topology');
+        })
+        .catch(() => {
+          window.location.replace('/?sso_error=' + encodeURIComponent('Sign-in link expired — please try again.'));
+        });
     }
   }, []);
 
