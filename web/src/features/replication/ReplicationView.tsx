@@ -4,10 +4,10 @@ import { useEffect, useMemo, useState } from 'react';
 import { Card, Modal } from '@/components/ui';
 import { useResources } from '@/lib/hooks';
 import {
-  useReplicationSets, useCreateReplication, useDeleteReplication, useRunReplication, usePromoteReplication, useUpdateReplication, useEnrollAgent,
+  useReplicationSets, useCreateReplication, useDeleteReplication, useRunReplication, usePromoteReplication, useUpdateReplication, useEnrollAgent, useStopReplication, useTestReplication,
   useVpnLinks, useCreateVpn, useDeleteVpn, useVpnUp, useVpnDown, useVpnLinkStatus, useVpnGatewayTypes, useVpnRequirements, useVpnEligibleHosts, useVpnMonitor,
-  useFabrics, useCreateFabric, useArmFabric, useRetryFabric, useDeprovisionFabric, useDeleteFabric,
-  type ReplicationSet, type ReplicationAgentInfo, type AgentEnroll, type VpnLink, type VpnRequirements, type VpnEligibleHost, type NetworkFabric,
+  useFabrics, useCreateFabric, useUpdateFabric, useArmFabric, useRetryFabric, useDeprovisionFabric, useDeleteFabric,
+  type ReplicationSet, type ReplicationAgentInfo, type AgentEnroll, type ReplicationTest, type VpnLink, type VpnRequirements, type VpnEligibleHost, type NetworkFabric,
 } from '@/lib/hooks';
 import { timeAgo } from '@/lib/format';
 import { downloadText } from '@/lib/clipboard';
@@ -27,8 +27,11 @@ export function ReplicationView() {
   const run = useRunReplication();
   const promote = usePromoteReplication();
   const update = useUpdateReplication();
+  const stop = useStopReplication();
   const [showNew, setShowNew] = useState(false);
+  const [edit, setEdit] = useState<ReplicationSet | null>(null);
   const [detail, setDetail] = useState<ReplicationSet | null>(null);
+  const [testSet, setTestSet] = useState<ReplicationSet | null>(null);
   const [installHost, setInstallHost] = useState<string | null>(null);
 
   const list = sets.data ?? [];
@@ -71,7 +74,8 @@ export function ReplicationView() {
                   <span className="text-sm font-semibold text-white">{s.name}</span>
                   <span className="rounded bg-bg px-1.5 py-0.5 text-2xs uppercase text-muted">{s.dataType}</span>
                   <span className="rounded bg-bg px-1.5 py-0.5 text-2xs text-muted-light">{s.mode}{s.mode === 'scheduled' ? ` · ${s.intervalMin}m` : ''}</span>
-                  {s.driver === 'agent' && <AgentBadge agent={s.primaryAgent} />}
+                  {s.driver === 'agent' && <AgentBadge agent={s.primaryAgent} role="primary" />}
+                  {s.driver === 'agent' && <AgentBadge agent={s.secondaryAgent} role="secondary" />}
                   <span className="ml-auto rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: st.color + '22', color: st.color }}>{st.label}</span>
                 </div>
                 <div className="mb-2 flex flex-wrap items-center gap-1.5 text-2xs">
@@ -99,7 +103,10 @@ export function ReplicationView() {
                     <button onClick={() => { if (confirm(`Fail back "${s.name}" to the PRIMARY (${s.primaryName})? Repoint DNS to ${s.primaryHost}.`)) promote.mutate({ id: s.id, to: 'primary' }); }} className="rounded-md border border-success/50 bg-success/10 px-2.5 py-1 text-2xs font-medium text-success hover:bg-success/20">↩ Fail back</button>
                   )}
                   {s.tertiaryHost && s.state !== 'tertiary-active' && <button onClick={() => { if (confirm(`Fail over to the TERTIARY (${s.tertiaryName})? Repoint DNS to ${s.tertiaryHost}.`)) promote.mutate({ id: s.id, to: 'tertiary' }); }} className="rounded-md border border-purple/40 px-2.5 py-1 text-2xs font-medium" style={{ borderColor: '#a855f766', color: '#c084fc' }}>⚡ → Tertiary</button>}
+                  <button onClick={() => setTestSet(s)} className="rounded-md border border-brand/40 bg-brand/10 px-2.5 py-1 text-2xs font-medium text-brand hover:bg-brand/20">✓ Test</button>
+                  <button onClick={() => setEdit(s)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">✎ Edit</button>
                   <button onClick={() => update.mutate({ id: s.id, enabled: !s.enabled })} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">{s.enabled ? 'Pause' : 'Resume'}</button>
+                  {s.enabled && <button onClick={() => { if (confirm(`Stop replication "${s.name}"? Scheduling is disabled and any in-progress run is cleared. (Data on the hosts is not touched; Resume re-enables it.)`)) stop.mutate(s.id); }} className="rounded-md border border-danger/40 bg-danger/10 px-2.5 py-1 text-2xs font-medium text-danger hover:bg-danger/20">■ Stop</button>}
                   {s.driver === 'agent' && <button onClick={() => setInstallHost(s.primaryHost)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">⤓ Install agent</button>}
                   <button onClick={() => setDetail(s)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">History</button>
                   <button onClick={() => { if (confirm(`Delete replication set "${s.name}"? (Data on the hosts is not touched.)`)) del.mutate(s.id); }} className="ml-auto rounded-md px-2 py-1 text-2xs text-danger hover:underline">Delete</button>
@@ -113,7 +120,9 @@ export function ReplicationView() {
       <FabricPanel />
       <VpnPanel />
 
-      {showNew && <NewSetModal onClose={() => setShowNew(false)} onCreate={(b) => create.mutateAsync(b).then(() => setShowNew(false))} busy={create.isPending} />}
+      {showNew && <SetModal mode="create" onClose={() => setShowNew(false)} onSave={(b) => create.mutateAsync(b).then(() => setShowNew(false))} busy={create.isPending} />}
+      {edit && <SetModal mode="edit" initial={edit} onClose={() => setEdit(null)} onSave={(b) => update.mutateAsync({ id: edit.id, ...b }).then(() => setEdit(null))} busy={update.isPending} />}
+      {testSet && <TestModal set={testSet} onClose={() => setTestSet(null)} />}
       {detail && <HistoryModal set={detail} onClose={() => setDetail(null)} />}
       {installHost && <AgentInstallModal host={installHost} onClose={() => setInstallHost(null)} />}
     </div>
@@ -129,13 +138,45 @@ function Kpi({ label, value, color }: { label: string; value: number; color: str
   );
 }
 
-function AgentBadge({ agent }: { agent: ReplicationAgentInfo | null }) {
+function AgentBadge({ agent, role }: { agent: ReplicationAgentInfo | null; role: 'primary' | 'secondary' }) {
   const online = !!agent?.online;
   const color = online ? '#22c55e' : '#f59e0b';
   return (
-    <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: color + '22', color }} title={agent ? `agent ${agent.host} · ${agent.os} v${agent.version} · last seen ${agent.lastSeenAt ? timeAgo(agent.lastSeenAt) : 'never'}` : 'agent not yet checked in'}>
-      ⤓ agent {online ? 'online' : agent ? 'offline' : 'pending'}
+    <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: color + '22', color }} title={agent ? `agent ${agent.host} · ${agent.os} v${agent.version} · last seen ${agent.lastSeenAt ? timeAgo(agent.lastSeenAt) : 'never'}` : `${role} agent not yet checked in`}>
+      ⤓ {role[0].toUpperCase()} agent {online ? 'online' : agent ? 'offline' : 'pending'}
     </span>
+  );
+}
+
+function TestModal({ set, onClose }: { set: ReplicationSet; onClose: () => void }) {
+  const test = useTestReplication();
+  const [res, setRes] = useState<ReplicationTest | null>(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { test.mutateAsync(set.id).then(setRes).catch(() => setRes(null)); }, [set.id]);
+  const ICON = { error: { s: '✗', c: '#ef4444' }, warn: { s: '▲', c: '#f59e0b' }, info: { s: '✓', c: '#22c55e' } } as const;
+  return (
+    <Modal wide title={`Connectivity test — ${set.name}`} onClose={onClose}>
+      <div className="space-y-3">
+        <div className="flex items-center gap-2 text-xs">
+          <button onClick={() => { setRes(null); test.mutateAsync(set.id).then(setRes).catch(() => setRes(null)); }} disabled={test.isPending} className="rounded-md bg-brand px-3 py-1 text-2xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{test.isPending ? '◌ Testing…' : '↻ Re-run test'}</button>
+          <span className="text-2xs text-muted">Driver: <b className="text-white">{set.driver === 'agent' ? 'Installed agent' : 'MCMF (SSH)'}</b></span>
+          {res && <span className="ml-auto rounded px-2 py-0.5 text-2xs font-medium" style={{ background: (res.ok ? '#22c55e' : '#ef4444') + '22', color: res.ok ? '#22c55e' : '#ef4444' }}>{res.ok ? '✓' : '✗'} {res.summary}</span>}
+        </div>
+        {!res ? <div className="py-6 text-center text-2xs text-muted">{test.isPending ? 'Running live diagnostics against each endpoint…' : 'No result.'}</div> : (
+          <div className="space-y-1">
+            {res.checks.map((c, i) => { const ic = c.ok ? ICON.info : ICON[c.level]; return (
+              <div key={i} className="flex items-start gap-2 rounded border border-border bg-bg/40 px-2.5 py-1.5 text-2xs">
+                <span style={{ color: ic.c }}>{ic.s}</span>
+                <span className="min-w-[9rem] font-medium text-white">{c.name}</span>
+                <span className="min-w-[7rem] font-mono text-muted">{c.target}</span>
+                <span className="flex-1 text-muted-light">{c.detail}</span>
+              </div>
+            ); })}
+          </div>
+        )}
+        <p className="text-2xs text-muted">Blocking issues (red) must be fixed before replication can run. Warnings (amber) are usually fine under the <b className="text-white">Installed agent</b> driver — e.g. MCMF can&apos;t reach a private/NAT&apos;d host directly, but the agent runs the job locally. Fix credentials in <b className="text-white">Credential Vault</b>, addresses/paths in <b className="text-white">✎ Edit</b>, and install the agent from the card.</p>
+      </div>
+    </Modal>
   );
 }
 
@@ -187,10 +228,32 @@ function Node({ label, name, host, on }: { label: string; name: string; host: st
   );
 }
 
-function NewSetModal({ onClose, onCreate, busy }: { onClose: () => void; onCreate: (b: Record<string, unknown>) => void; busy: boolean }) {
+function SetModal({ mode, initial, onClose, onSave, busy }: { mode: 'create' | 'edit'; initial?: ReplicationSet; onClose: () => void; onSave: (b: Record<string, unknown>) => void; busy: boolean }) {
+  const editing = mode === 'edit';
   const vms = useResources({ type: 'compute' });
-  const [f, setF] = useState({ name: '', dataType: 'files', mode: 'scheduled', driver: 'orchestrated', primaryId: '', secondaryId: '', tertiaryId: '', sourcePath: '', targetPath: '', dbEngine: 'postgres', dbName: '', dbUser: '', dbPassword: '', dockerVolumes: '', blockDevice: '', blockDeviceB: '', drbdPort: 7789, drbdMinor: 0, drbdMount: '', intervalMin: 15, intervalSec: 30 });
+  const [f, setF] = useState(() => ({
+    name: initial?.name ?? '', dataType: initial?.dataType ?? 'files', mode: initial?.mode ?? 'scheduled', driver: initial?.driver ?? 'orchestrated',
+    primaryId: initial?.primaryId ?? '', secondaryId: initial?.secondaryId ?? '', tertiaryId: initial?.tertiaryId ?? '',
+    primaryHost: initial?.primaryHost ?? '', secondaryHost: initial?.secondaryHost ?? '', tertiaryHost: initial?.tertiaryHost ?? '',
+    primaryOs: initial?.primaryOs ?? '', secondaryOs: initial?.secondaryOs ?? '', tertiaryOs: initial?.tertiaryOs ?? '',
+    sourcePath: initial?.sourcePath ?? '', targetPath: initial?.targetPath ?? '', dbEngine: initial?.dbEngine ?? 'postgres', dbName: initial?.dbName ?? '', dbUser: initial?.dbUser ?? '', dbPassword: '',
+    dockerVolumes: initial?.dockerVolumes ?? '', blockDevice: initial?.blockDevice ?? '', blockDeviceB: initial?.blockDeviceB ?? '', drbdPort: initial?.drbdPort ?? 7789, drbdMinor: initial?.drbdMinor ?? 0, drbdMount: initial?.drbdMount ?? '',
+    intervalMin: initial?.intervalMin ?? 15, intervalSec: initial?.intervalSec || 30,
+  }));
   const opts = (vms.data ?? []).map((r: any) => ({ id: r.id, label: `${r.name} (${r.provider})` }));
+  const vmById = new Map((vms.data ?? []).map((r: any) => [r.id, r]));
+  // Per-endpoint address picker: choose which IP to replicate over (Auto / Private / Public).
+  const addr = (vmKey: keyof typeof f, hostKey: keyof typeof f) => {
+    const r: any = vmById.get(f[vmKey] as string);
+    if (!r || (!r.privateIp && !r.publicIp)) return null;
+    return (
+      <select value={f[hostKey] as string} onChange={(e) => setF({ ...f, [hostKey]: e.target.value })} className="mt-1 w-full rounded-lg border border-border bg-bg px-2.5 py-1 text-2xs text-muted-light focus:border-brand focus:outline-none" title="Which address to replicate over">
+        <option value="">Address: Auto (cross-cloud → public)</option>
+        {r.privateIp && <option value={r.privateIp}>Private · {r.privateIp}</option>}
+        {r.publicIp && <option value={r.publicIp}>Public · {r.publicIp}</option>}
+      </select>
+    );
+  };
   const sel = (label: string, key: keyof typeof f, allowNone = false) => (
     <label className="block"><span className="mb-1 block text-2xs text-muted">{label}</span>
       <select value={f[key] as string} onChange={(e) => setF({ ...f, [key]: e.target.value })} className="w-full rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs text-white focus:border-brand focus:outline-none">
@@ -199,9 +262,35 @@ function NewSetModal({ onClose, onCreate, busy }: { onClose: () => void; onCreat
       </select>
     </label>
   );
-  const valid = f.name && f.primaryId && f.secondaryId && f.primaryId !== f.secondaryId && (f.dataType !== 'database' || !!f.dbName) && (f.dataType !== 'docker' || !!f.dockerVolumes) && (f.dataType !== 'block' || !!f.blockDevice);
+  // OS picker per endpoint — REQUIRED information for building the right sync command (Windows vs Linux).
+  const osSel = (osKey: keyof typeof f) => (
+    <select value={f[osKey] as string} onChange={(e) => setF({ ...f, [osKey]: e.target.value })} className="mt-1 w-full rounded-lg border border-border bg-bg px-2.5 py-1 text-2xs text-muted-light focus:border-brand focus:outline-none" title="Operating system of this endpoint">
+      <option value="">OS: Auto (from provider)</option>
+      <option value="linux">🐧 Linux</option>
+      <option value="windows">🪟 Windows</option>
+    </select>
+  );
+  // In edit mode the VM identity is fixed; expose an editable Host/IP field (+ OS) so the operator can
+  // change the target address (public/private/custom) or OS without recreating the set.
+  const endpoint = (role: 'primary' | 'secondary' | 'tertiary', label: string, allowNone = false) => {
+    const idKey = `${role}Id` as keyof typeof f, hostKey = `${role}Host` as keyof typeof f, osKey = `${role}Os` as keyof typeof f;
+    if (editing) {
+      const nm = role === 'primary' ? initial?.primaryName : role === 'secondary' ? initial?.secondaryName : initial?.tertiaryName;
+      return (
+        <div>
+          <span className="mb-1 block text-2xs text-muted">{label}{nm ? ` · ${nm}` : ''}</span>
+          <input value={f[hostKey] as string} onChange={(e) => setF({ ...f, [hostKey]: e.target.value })} placeholder="host / IP (public or private)" className="w-full rounded-lg border border-border bg-bg px-2.5 py-1.5 font-mono text-xs text-white focus:border-brand focus:outline-none" />
+          {osSel(osKey)}
+        </div>
+      );
+    }
+    return <div>{sel(label, idKey, allowNone)}{addr(idKey, hostKey)}{f[idKey] && osSel(osKey)}</div>;
+  };
+  const valid = !!f.name
+    && (editing ? (!!f.primaryHost && !!f.secondaryHost) : (!!f.primaryId && !!f.secondaryId && f.primaryId !== f.secondaryId))
+    && (f.dataType !== 'database' || !!f.dbName) && (f.dataType !== 'docker' || !!f.dockerVolumes) && (f.dataType !== 'block' || !!f.blockDevice);
   return (
-    <Modal wide onClose={onClose} title="New replication set">
+    <Modal wide onClose={onClose} title={editing ? `Edit replication set — ${initial?.name}` : 'New replication set'}>
       <div className="space-y-3">
         <label className="block"><span className="mb-1 block text-2xs text-muted">Name</span><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. webapp-gcp-to-aws" className="w-full rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs text-white focus:border-brand focus:outline-none" /></label>
         <div className="grid gap-3 sm:grid-cols-2">
@@ -209,9 +298,9 @@ function NewSetModal({ onClose, onCreate, busy }: { onClose: () => void; onCreat
           <label className="block"><span className="mb-1 block text-2xs text-muted">Mode</span><select value={f.mode} onChange={(e) => setF({ ...f, mode: e.target.value })} className="w-full rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs text-white focus:border-brand focus:outline-none"><option value="scheduled">Scheduled</option><option value="async">Asynchronous (near-real-time)</option><option value="sync">Synchronous</option></select></label>
         </div>
         <div className="grid gap-3 sm:grid-cols-3">
-          {sel('Primary VM', 'primaryId')}
-          {sel('Secondary VM (other cloud)', 'secondaryId')}
-          {sel('Tertiary VM (optional)', 'tertiaryId', true)}
+          {endpoint('primary', 'Primary VM')}
+          {endpoint('secondary', 'Secondary VM (other cloud)')}
+          {endpoint('tertiary', 'Tertiary VM (optional)', true)}
         </div>
         {f.dataType === 'files' && (
           <div className="grid gap-3 sm:grid-cols-2">
@@ -251,7 +340,7 @@ function NewSetModal({ onClose, onCreate, busy }: { onClose: () => void; onCreat
         {f.driver === 'agent'
           ? <div className="rounded-lg border border-brand/30 bg-brand/5 px-3 py-2 text-2xs text-muted">The <b className="text-white">installed agent</b> on the primary pulls its jobs from MCMF and runs them locally (no inbound SSH from MCMF needed). After creating the set, click <b className="text-white">Install agent</b> on its card for the one-line installer. The agent still uses the target host's Credential-Vault SSH creds to push data.</div>
           : <div className="rounded-lg border border-border bg-bg/40 px-3 py-2 text-2xs text-muted">Replication runs over SSH using the credentials in your <b className="text-white">Credential Vault</b> for each host (files need <code>rsync</code> + <code>sshpass</code> on the source). On failover, MCMF marks the new active side — you repoint DNS externally.</div>}
-        <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs text-muted-light hover:text-white">Cancel</button><button onClick={() => onCreate(f)} disabled={!valid || busy} className="rounded-lg bg-brand px-4 py-1.5 text-xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{busy ? 'Creating…' : 'Create'}</button></div>
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs text-muted-light hover:text-white">Cancel</button><button onClick={() => onSave(f)} disabled={!valid || busy} className="rounded-lg bg-brand px-4 py-1.5 text-xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{busy ? 'Saving…' : editing ? 'Save changes' : 'Create'}</button></div>
       </div>
     </Modal>
   );
@@ -274,8 +363,9 @@ function FabricCapChip({ p }: { p: string }) {
 
 function FabricPanel() {
   const fabrics = useFabrics();
-  const create = useCreateFabric(); const arm = useArmFabric(); const retry = useRetryFabric(); const teardown = useDeprovisionFabric(); const del = useDeleteFabric();
+  const create = useCreateFabric(); const upd = useUpdateFabric(); const arm = useArmFabric(); const retry = useRetryFabric(); const teardown = useDeprovisionFabric(); const del = useDeleteFabric();
   const [showNew, setShowNew] = useState(false);
+  const [edit, setEdit] = useState<NetworkFabric | null>(null);
   const [detail, setDetail] = useState<NetworkFabric | null>(null);
   const list = fabrics.data ?? [];
   return (
@@ -314,6 +404,7 @@ function FabricPanel() {
                         ? <span className="rounded-md border border-success/40 px-2.5 py-1 text-2xs text-success">✓ provisioned · monitored above</span>
                         : <span className="rounded-md border border-border px-2.5 py-1 text-2xs text-muted-light">◌ running…</span>}
                   {(f.aGatewayId || f.bGatewayId || f.aConnId || f.bConnId || f.vpnLinkId) && <button onClick={() => { if (confirm(`Tear down the cloud VPN resources for "${f.name}"?\n\nThis deletes the VPN gateways + connections in ${f.aProvider.toUpperCase()} and ${f.bProvider.toUpperCase()} (the billable parts). Networks/VNets are left in place. Azure gateway deletion takes ~10 min.`)) teardown.mutate(f.id); }} disabled={teardown.isPending} className="rounded-md border border-warning/50 bg-warning/10 px-2.5 py-1 text-2xs font-medium text-warning hover:bg-warning/20 disabled:opacity-50">{teardown.isPending ? '◌ Tearing down…' : '⤓ Tear down'}</button>}
+                  {(!f.armed || f.status === 'error') && <button onClick={() => setEdit(f)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">✎ Edit</button>}
                   {f.steps?.length ? <button onClick={() => setDetail(f)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">Progress</button> : null}
                   <button onClick={() => { if (confirm(`Delete fabric record "${f.name}"? (Cloud resources already created are NOT deleted — remove them via ⤓ Tear down first, or in each cloud console.)`)) del.mutate(f.id); }} className="ml-auto rounded-md px-2 py-1 text-2xs text-danger hover:underline">Delete</button>
                 </div>
@@ -322,7 +413,8 @@ function FabricPanel() {
           })}
         </div>
       )}
-      {showNew && <NewFabricModal onClose={() => setShowNew(false)} onCreate={(b) => create.mutateAsync(b).then(() => setShowNew(false)).catch(() => undefined)} busy={create.isPending} />}
+      {showNew && <NewFabricModal onClose={() => setShowNew(false)} onSave={(b) => create.mutateAsync(b).then(() => setShowNew(false)).catch(() => undefined)} busy={create.isPending} />}
+      {edit && <NewFabricModal initial={edit} onClose={() => setEdit(null)} onSave={(b) => upd.mutateAsync({ id: edit.id, ...b }).then(() => setEdit(null))} busy={upd.isPending} />}
       {detail && (
         <Modal wide title={`Fabric progress — ${detail.name}`} onClose={() => setDetail(null)}>
           <div className="max-h-[60vh] space-y-1 overflow-auto">
@@ -340,8 +432,15 @@ function FabricPanel() {
   );
 }
 
-function NewFabricModal({ onClose, onCreate, busy }: { onClose: () => void; onCreate: (b: Record<string, unknown>) => void; busy: boolean }) {
-  const [f, setF] = useState({ name: '', psk: '', aProvider: 'aws', aRegion: 'us-east-1', aCidr: '10.10.0.0/16', aSubnetCidr: '10.10.0.0/24', bProvider: 'azure', bRegion: 'eastus', bCidr: '10.20.0.0/16', bSubnetCidr: '10.20.0.0/24' });
+function NewFabricModal({ initial, onClose, onSave, busy }: { initial?: NetworkFabric; onClose: () => void; onSave: (b: Record<string, unknown>) => Promise<unknown> | void; busy: boolean }) {
+  const editing = !!initial;
+  const [err, setErr] = useState('');
+  const [f, setF] = useState({
+    name: initial?.name ?? '', psk: '',
+    aProvider: initial?.aProvider ?? 'aws', aRegion: initial?.aRegion ?? 'us-east-1', aCidr: initial?.aCidr ?? '10.10.0.0/16', aSubnetCidr: initial?.aSubnetCidr ?? '10.10.0.0/24',
+    bProvider: initial?.bProvider ?? 'azure', bRegion: initial?.bRegion ?? 'eastus', bCidr: initial?.bCidr ?? '10.20.0.0/16', bSubnetCidr: initial?.bSubnetCidr ?? '10.20.0.0/24',
+  });
+  const submit = () => { setErr(''); const r = onSave(f); if (r && typeof (r as any).catch === 'function') (r as Promise<unknown>).catch((e: any) => setErr(String(e?.message || e))); };
   const side = (s: 'a' | 'b') => (
     <div className="rounded-lg border border-border bg-bg/30 p-2.5 space-y-2">
       <div className="flex items-center gap-2 text-2xs font-semibold uppercase text-muted">Side {s.toUpperCase()} <FabricCapChip p={s === 'a' ? f.aProvider : f.bProvider} /></div>
@@ -353,9 +452,20 @@ function NewFabricModal({ onClose, onCreate, busy }: { onClose: () => void; onCr
       </div>
     </div>
   );
-  const valid = f.name && f.aProvider !== f.bProvider && f.aCidr && f.bCidr;
+  // Region-format sanity — mirrors the server. Azure locations have NO dashes (eastus); AWS/GCP do
+  // (us-east-1 / us-central1). Catches the #1 foot-gun: switching the cloud but leaving the default region.
+  const regionErr = (provider: string, region: string): string | null => {
+    const r = (region || '').trim();
+    if (!r) return 'region required';
+    if (provider === 'azure') return r.includes('-') || !/^[a-z][a-z0-9]+$/.test(r) ? 'Azure location has no dashes (e.g. eastus) — looks like another cloud’s region' : null;
+    if (provider === 'aws') return /^[a-z]{2}-[a-z]+-\d+$/.test(r) ? null : 'AWS region looks like us-east-1 — looks like another cloud’s region';
+    if (provider === 'gcp') return /^[a-z]+-[a-z]+\d+$/.test(r) ? null : 'GCP region looks like us-central1';
+    return null;
+  };
+  const aRegErr = regionErr(f.aProvider, f.aRegion), bRegErr = regionErr(f.bProvider, f.bRegion);
+  const valid = f.name && f.aProvider !== f.bProvider && f.aCidr && f.bCidr && !aRegErr && !bRegErr;
   return (
-    <Modal wide title="New cross-cloud network fabric" onClose={onClose}>
+    <Modal wide title={editing ? `Edit fabric — ${initial?.name}` : 'New cross-cloud network fabric'} onClose={onClose}>
       <div className="space-y-3">
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="block"><span className="mb-1 block text-2xs text-muted">Name</span><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="aws-azure-fabric" className="w-full rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs text-white focus:border-brand focus:outline-none" /></label>
@@ -363,8 +473,11 @@ function NewFabricModal({ onClose, onCreate, busy }: { onClose: () => void; onCr
         </div>
         <div className="grid gap-3 lg:grid-cols-2">{side('a')}{side('b')}</div>
         {f.aProvider === f.bProvider && <div className="text-2xs text-danger">Pick two different clouds.</div>}
-        <div className="rounded-lg border border-border bg-bg/40 px-3 py-2 text-2xs text-muted">Creates as a <b className="text-white">draft</b>. Provisioning starts only when you <b className="text-white">Arm</b> it on the card. Requires both clouds connected under Cloud Connections. MCMF provisions the network + gateway + connection on each side via provider APIs, then registers the tunnel with the monitor above.</div>
-        <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs text-muted-light hover:text-white">Cancel</button><button onClick={() => onCreate(f)} disabled={!valid || busy} className="rounded-lg bg-brand px-4 py-1.5 text-xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{busy ? 'Creating…' : 'Create draft'}</button></div>
+        {aRegErr && <div className="text-2xs text-danger">Side A ({f.aProvider.toUpperCase()}): {aRegErr}.</div>}
+        {bRegErr && <div className="text-2xs text-danger">Side B ({f.bProvider.toUpperCase()}): {bRegErr}.</div>}
+        {err && <div className="break-words rounded border border-danger/30 bg-danger/10 px-2 py-1 text-2xs text-danger">{err}</div>}
+        <div className="rounded-lg border border-border bg-bg/40 px-3 py-2 text-2xs text-muted">{editing ? <>Editing is allowed while the fabric is a <b className="text-white">draft</b> or has <b className="text-white">errored</b> (an errored fabric resets to draft so you can re-Arm). Tear down first to edit a live one.</> : <>Creates as a <b className="text-white">draft</b>. Provisioning starts only when you <b className="text-white">Arm</b> it on the card.</>} Requires both clouds connected under Cloud Connections. MCMF provisions the network + gateway + connection on each side via provider APIs, then registers the tunnel with the monitor above.</div>
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs text-muted-light hover:text-white">Cancel</button><button onClick={submit} disabled={!valid || busy} className="rounded-lg bg-brand px-4 py-1.5 text-xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{busy ? 'Saving…' : editing ? 'Save changes' : 'Create draft'}</button></div>
       </div>
     </Modal>
   );
@@ -397,7 +510,7 @@ function VpnPanel() {
                 <span className="rounded bg-bg px-1.5 py-0.5 text-2xs uppercase text-muted">{l.tech}</span>
                 <span className="rounded bg-bg px-1.5 py-0.5 text-2xs text-muted-light">{l.mode} · {l.ikeVersion}</span>
                 <span className="rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: (l.manage === 'monitor' ? '#a855f7' : '#3b82f6') + '22', color: l.manage === 'monitor' ? '#c084fc' : '#60a5fa' }} title={l.manage === 'monitor' ? 'You set up the tunnel; MCMF only monitors it' : 'MCMF configures strongSwan on the VM endpoint(s)'}>{l.manage === 'monitor' ? '👁 monitor-only' : '⚙ auto-config'}</span>
-                <span className="ml-auto rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: (VPN_COLOR[l.status] ?? '#64748b') + '22', color: VPN_COLOR[l.status] ?? '#64748b' }}>{l.status}{l.statusSource ? ` · ${l.statusSource}` : ''}</span>
+                <span className="ml-auto rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: (VPN_COLOR[l.status] ?? '#64748b') + '22', color: VPN_COLOR[l.status] ?? '#64748b' }}>{l.status === 'up' ? '● connected' : l.status}{l.statusSource ? ` · ${l.statusSource}` : ''}</span>
               </div>
               <div className="mb-2 flex flex-wrap items-center gap-1.5 text-2xs">
                 <span className="inline-flex flex-col gap-0.5 rounded-lg border border-border bg-bg px-2 py-1"><span className="flex items-center gap-1"><span className="text-muted">{l.aName || 'Side A'}</span>{l.aProvider && <ProvChip p={l.aProvider} />}</span><span className="font-mono text-white">{l.aHost}</span><span className="font-mono text-muted">{l.aSubnet}</span></span>
@@ -413,9 +526,9 @@ function VpnPanel() {
                   <button onClick={() => mon.mutate(l.id)} disabled={mon.isPending} className="rounded-md bg-brand px-2.5 py-1 text-2xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{mon.isPending ? '◌ Checking…' : '✓ Check now'}</button>
                 ) : (
                   <>
-                    <button onClick={() => up.mutate(l.id)} disabled={up.isPending} className="rounded-md bg-brand px-2.5 py-1 text-2xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{up.isPending ? '◌ Bringing up…' : '▲ Bring up'}</button>
-                    <button onClick={() => stat.mutate(l.id)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">↻ Refresh</button>
-                    <button onClick={() => down.mutate(l.id)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">▼ Down</button>
+                    <button onClick={() => up.mutate(l.id)} disabled={up.isPending} className="rounded-md bg-brand px-2.5 py-1 text-2xs font-medium text-white hover:bg-brand-soft disabled:opacity-50">{up.isPending ? '◌ Bringing up…' : l.status === 'up' ? '↻ Re-establish' : '▲ Bring up'}</button>
+                    <button onClick={() => stat.mutate(l.id)} disabled={stat.isPending} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white disabled:opacity-50">{stat.isPending ? '◌ Checking…' : '↻ Refresh status'}</button>
+                    {l.status === 'up' && <button onClick={() => down.mutate(l.id)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">▼ Down</button>}
                   </>
                 )}
                 {l.lastStatus && <button onClick={() => setDetail(l)} className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white">SA status</button>}

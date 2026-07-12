@@ -442,6 +442,8 @@ export interface ResourceRow {
   memUsedMB: number | null;
   monthlyCost: number;
   account: string | null;
+  publicIp?: string | null;
+  privateIp?: string | null;
 }
 
 export interface Dataset {

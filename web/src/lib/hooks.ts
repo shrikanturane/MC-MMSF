@@ -962,7 +962,8 @@ export interface ReplicationSet {
   primaryId: string; primaryName: string; primaryHost: string;
   secondaryId: string; secondaryName: string; secondaryHost: string;
   tertiaryId: string; tertiaryName: string; tertiaryHost: string;
-  sourcePath: string; targetPath: string; dbEngine: string; dbName: string; dockerVolumes: string; driver: string; intervalMin: number; intervalSec: number;
+  primaryOs?: string; secondaryOs?: string; tertiaryOs?: string;
+  sourcePath: string; targetPath: string; dbEngine: string; dbName: string; dbUser?: string; dockerVolumes: string; driver: string; intervalMin: number; intervalSec: number;
   blockDevice: string; blockDeviceB: string; drbdPort: number; drbdMinor: number; drbdMount: string;
   enabled: boolean; status: string; state: string; lastError: string;
   primaryAgent: ReplicationAgentInfo | null; secondaryAgent: ReplicationAgentInfo | null;
@@ -982,6 +983,10 @@ export const useUpdateReplication = () => useReplMutation(({ id, ...b }: { id: s
 export const useDeleteReplication = () => useReplMutation((id: string) => apiDelete(`/replication/${id}`));
 export const useRunReplication = () => useReplMutation(({ id, direction }: { id: string; direction?: string }) => apiPost(`/replication/${id}/run`, { direction }));
 export const usePromoteReplication = () => useReplMutation(({ id, to }: { id: string; to: string }) => apiPost(`/replication/${id}/promote`, { to }));
+export const useStopReplication = () => useReplMutation((id: string) => apiPost(`/replication/${id}/stop`, {}));
+export interface ReplicationCheck { name: string; target: string; ok: boolean; level: 'error' | 'warn' | 'info'; detail: string }
+export interface ReplicationTest { ok: boolean; summary: string; driver: string; checks: ReplicationCheck[] }
+export const useTestReplication = () => useMutation({ mutationFn: (id: string) => apiPost<ReplicationTest>(`/replication/${id}/test`, {}) });
 export const useEnrollAgent = () => useMutation({ mutationFn: ({ host }: { host: string }) => apiPost<AgentEnroll>('/replication/agent/enroll', { host, baseUrl: typeof window !== 'undefined' ? window.location.origin : '' }) });
 
 export interface VpnLink {
@@ -1027,6 +1032,7 @@ const useFabricMutation = <T,>(fn: (v: T) => Promise<unknown>) => {
   return useMutation({ mutationFn: fn, onSuccess: () => qc.invalidateQueries({ queryKey: ['fabric'] }) });
 };
 export const useCreateFabric = () => useFabricMutation((b: Record<string, unknown>) => apiPost('/fabric', b));
+export const useUpdateFabric = () => useFabricMutation(({ id, ...b }: { id: string } & Record<string, unknown>) => apiPatch(`/fabric/${id}`, b));
 export const useArmFabric = () => useFabricMutation((id: string) => apiPost(`/fabric/${id}/arm`, {}));
 export const useRetryFabric = () => useFabricMutation((id: string) => apiPost(`/fabric/${id}/retry`, {}));
 export const useDeprovisionFabric = () => useFabricMutation((id: string) => apiPost(`/fabric/${id}/deprovision`, {}));

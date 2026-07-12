@@ -361,9 +361,25 @@ UPDATING / REMOVING
 • Block device — DRBD (SYNCHRONOUS, RPO 0). True block-level mirroring with protocol C: every write is committed on both nodes before it's acknowledged, so zero data is lost on failover. MCMF installs drbd-utils, writes the resource, brings it up on both nodes, makes the primary Primary (seeding the initial full sync), and reports drbdadm status; "Sync now" re-runs this idempotently as a health-heal. The backing device must be a DEDICATED, empty block device or LVM volume on BOTH hosts (DRBD stores its metadata on the device — any existing filesystem there is lost). Linux-only. Open the DRBD TCP port (default 7789) between the hosts. On failover MCMF promotes the secondary with drbdadm primary and demotes the old primary.
 Set the schedule per set: scheduled (every N minutes), async (ship deltas ~every few minutes), or sync. For files/database/docker, "sync" is NEAR-sync — MCMF runs the engine every N seconds (default 30, min 10; set "Near-sync interval") for near-real-time but NOT zero-RPO. For true RPO 0 use the DRBD block engine, which replicates continuously in the kernel (not on a timer).
 
+──────── ENDPOINTS: OS + ADDRESS (Windows or Linux, public or private) ────────
+When you create or edit a set, each endpoint (primary / secondary / tertiary) has:
+• OS — 🐧 Linux or 🪟 Windows. This is REQUIRED so MCMF builds the right sync command (Windows uses PowerShell + tar/OpenSSH; Linux uses rsync/bash). "Auto (from provider)" infers it from the resource — but SET IT EXPLICITLY for a Windows box whose inventory record doesn't say "windows", or Windows→Windows file sync will try a Linux command and fail. Both a Windows PC and a Linux VM are valid on either side.
+• Address — which IP to replicate over. "Auto" picks a PUBLIC IP for cross-cloud pairs (a private 10.x/172.16-31.x/192.168.x address cannot route between clouds or from an off-network MCMF) and a private IP same-cloud. Override to Private (same VPC / over a VPN) or Public per side. In ✎ Edit you can type any host/IP directly.
+
+──────── STEP-BY-STEP: replicate Azure ⇄ AWS (Windows PCs) ────────
+1. + New replication set → Name it, Data type = Files, pick the Primary (Azure) and Secondary (AWS) VMs.
+2. Set each endpoint's OS = 🪟 Windows and Address = Public (so the two clouds can reach each other). Set Source path (e.g. C:\\data) and Target path (e.g. C:\\data).
+3. Run via = Installed agent (MCMF on a private LAN can't SSH into cloud VMs; the agent runs the sync locally, outbound-only).
+4. Add the SECONDARY's SSH credential to Credential Vault (the agent installs its key there once). Open the AWS security group so the Azure PC can SSH to the AWS PC (port 22).
+5. Create → on the card click ⤓ Install agent, run the one-liner on the Azure PC (and on the AWS PC too, so it can sync back after a failover).
+6. Click ✓ Test — it runs live checks and shows exactly what's still missing (credential, agent online, reachability, path). Fix reds, re-test, then Sync now.
+
+──────── CARD ACTIONS ────────
+• Sync now — run one hop immediately.   • ✓ Test — live connectivity/credential/agent/tool/path diagnostic; shows where it fails (red = blocking, amber = advisory).   • ✎ Edit — change ANY field later: hosts/IP, per-endpoint OS, paths, DB engine/name/user/password, docker volumes, DRBD device, driver, schedule.   • Pause / Resume — toggle scheduling.   • ■ Stop — hard-stop (disable scheduling + clear any in-progress run); Resume re-enables.   • ⚡ Fail over / ↩ Fail back — mark the active side.   • History — every run with output.
+
 ──────── RUN VIA: MCMF (SSH) vs INSTALLED AGENT ────────
-• MCMF (SSH) — MCMF connects OUT to the source host over SSH (Credential Vault creds) and runs the engine. Nothing to install; good when MCMF can reach the source.
-• Installed agent — a small agent runs ON the host and does the replication locally, then reports status to MCMF. Use this when MCMF should not / cannot SSH into the source (private/NAT'd hosts, tighter blast radius). MCMF stays status-only for agent sets; its own SSH scheduler skips them.
+• MCMF (SSH) — MCMF connects OUT to the source host over SSH (Credential Vault creds) and runs the engine. Nothing to install; good when MCMF can reach the source. NOTE: if MCMF is on a private network it usually CANNOT reach cloud VMs — use the agent instead.
+• Installed agent — a small agent runs ON the host and does the replication locally, then reports status to MCMF. Use this when MCMF should not / cannot SSH into the source (private/NAT'd hosts, cross-cloud, tighter blast radius). MCMF stays status-only for agent sets; its own SSH scheduler skips them. The card shows the PRIMARY and SECONDARY agent's status (online / offline / pending, with OS + version + last-seen on hover).
 
 ──────── THE STANDALONE AGENT (Linux + Windows) ────────
 Both agents behave the same way. Get them two ways: (1) Replication → a set's card → "⤓ Install agent" (per-host, pick 🐧 Linux or 🪟 Windows), or (2) Help → Agents & Infra → "Replication & DR Agent — download & install" — pick the host + OS and ⤓ Download the ready-to-run agent (.sh / .ps1) or copy the one-line installer. Either way, run it on the host as root/Administrator. Install the agent on BOTH the primary and the secondary so replication can resume after a failover.
@@ -374,7 +390,12 @@ Both agents behave the same way. Get them two ways: (1) Replication → a set's 
 • Outbound-only — the agent needs OUTBOUND access to MCMF and SSH to the target. Nothing inbound is opened on the host.
 
 LINUX agent — installs curl/jq/rsync/openssh-client, drops /opt/mcmf-repl/agent.sh, and enables the mcmf-repl-agent.timer. Logs: journalctl -u mcmf-repl-agent.service -f. Remove: sudo bash /opt/mcmf-repl/agent.sh uninstall.
+  Install URL (served per host with its enrollment key): {MCMF_URL}/api/replication/agent/script?key={AGENT_KEY}&url={MCMF_URL}&os=linux
+  One-liner (run as root):  curl -fsSk '{that URL}' -o /tmp/mcmf-repl-agent.sh && sudo bash /tmp/mcmf-repl-agent.sh install
 WINDOWS agent — a PowerShell script under %ProgramData%\\MCMF-Repl, registered as the "MCMF Replication Agent" SYSTEM scheduled task. It auto-enables the built-in OpenSSH client. Remove: run the script with the uninstall argument, or Unregister-ScheduledTask -TaskName 'MCMF Replication Agent'.
+  Install URL (served per host with its enrollment key): {MCMF_URL}/api/replication/agent/script?key={AGENT_KEY}&url={MCMF_URL}&os=windows
+  One-liner (run in an elevated PowerShell):  powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iwr '{that URL}' -OutFile $env:TEMP\\mcmf-repl-agent.ps1; & $env:TEMP\\mcmf-repl-agent.ps1 install"
+The exact URLs + copy/download buttons for BOTH OSes are generated for each host in Replication → the set's card → "⤓ Install agent" (or Help → Agents & Infra). {MCMF_URL} is your MCMF base URL; {AGENT_KEY} is the per-host key MCMF mints on enrollment.
 
 ──────── TRANSPORT: KEY-BASED SSH (auto-provisioned) ────────
 Agents push over key-based SSH — no passwords on the host. On first install the agent generates an SSH keypair; on its first check-in MCMF installs the agent's PUBLIC key onto the target's authorized_keys using the target's Credential-Vault SSH credentials. So before installing the agent, add the TARGET host's SSH creds to the Credential Vault. (If MCMF cannot reach the target to install the key, the installer also prints the public key so you can authorize it manually.) The DB engines still use the database password you set on the replication set (stored encrypted).
@@ -412,10 +433,12 @@ ON-PREM → CLOUD — mark side B "external gateway / on-prem", enter its public
 • Once "up", point a replication set at the peer's PRIVATE subnet address so the data rides the tunnel.
 • Status shows up / down / error; "SA status" shows the raw swanctl --list-sas (look for ESTABLISHED + INSTALLED).
 
-──────── COMMON ISSUES ────────
-• "No SSH credential for the target host …" — add the target's SSH creds in Credential Vault (needed for MCMF-SSH runs and, for agents, to install the key once).
+──────── COMMON ISSUES (run ✓ Test first — it pinpoints most of these) ────────
+• "No SSH credential for the source/target host …" — add that host's SSH creds in Credential Vault (needed for MCMF-SSH runs and, for agents, to install the key once). If the host shown is a PRIVATE IP (10.x / 172.16-31.x / 192.168.x) on a cross-cloud pair, that's the real problem: ✎ Edit → set that endpoint's Address = Public.
+• Set shows a private IP that MCMF can't reach — you're on the MCMF-SSH (orchestrated) driver on a private network. Switch Run via = Installed agent (✎ Edit), install the agent on the source, and it runs the sync outbound-locally.
+• Windows→Windows file sync fails on the target — set BOTH endpoints' OS = 🪟 Windows (✎ Edit). If OS was "Auto" and the inventory didn't tag the box as Windows, MCMF built a Linux command.
 • Agent badge stuck "offline/pending" — the service isn't checking in: confirm the host has outbound HTTPS to MCMF; Linux: systemctl status mcmf-repl-agent.timer; Windows: Get-ScheduledTask 'MCMF Replication Agent'.
-• DB/rsync/docker "not found" in History — install the client tools on the SOURCE (rsync, postgresql-client/mysql-client, or docker).
+• DB/rsync/docker "not found" in History — install the client tools on the SOURCE (rsync, postgresql-client/mysql-client, or docker). ✓ Test flags these when it can reach the source.
 • Windows push fails auth — the agent's key isn't on the target yet: make sure the target's SSH creds are in the Vault, or paste the agent's printed public key into the target's authorized_keys.`,
   },
   {

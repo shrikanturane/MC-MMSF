@@ -297,6 +297,9 @@ export class InventoryService {
         memUsedMB: typeof p.memUsedMB === 'number' ? p.memUsedMB : null,
         monthlyCost: Number(r.monthlyCost.toFixed(2)),
         account: r.cloudAccount?.name ?? null,
+        // Addresses so the UI (e.g. replication) can let the operator pick which to use.
+        publicIp: p.publicIp ?? null,
+        privateIp: p.privateIp ?? (['linux', 'windows'].includes(r.provider) ? r.region : null),
       };
     });
   }

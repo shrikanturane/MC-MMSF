@@ -959,6 +959,9 @@ model ReplicationSet {
   tertiaryId    String    @default("")
   tertiaryHost  String    @default("")
   tertiaryName  String    @default("")
+  primaryOs     String    @default("") // linux | windows (explicit; falls back to the resource provider)
+  secondaryOs   String    @default("")
+  tertiaryOs    String    @default("")
   sourcePath    String    @default("") // files: source dir; database: db name
   targetPath    String    @default("") // files: target dir
   dbEngine      String    @default("postgres") // database: postgres | mysql

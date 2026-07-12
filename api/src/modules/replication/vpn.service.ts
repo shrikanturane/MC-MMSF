@@ -180,11 +180,21 @@ export class VpnService implements OnModuleInit {
       'connections {',
       `  ${conn} {`,
       `    version = ${version}`,
-      `    local_addrs = ${selfIp}`,
+      // Cloud VMs sit behind 1:1 NAT — the PUBLIC IP isn't on the interface, so binding local_addrs to it
+      // fails. Bind to any local interface (%any) and let NAT-T carry it; the public IP stays the IKE id below.
+      `    local_addrs = %any`,
       `    remote_addrs = ${peerIp}`,
       `    proposals = ${ike}`,
-      `    local { auth = psk; id = ${selfIp} }`,
-      `    remote { auth = psk; id = ${peerIp} }`,
+      // strongSwan config reads a value to end-of-line — inline `{ auth = psk; id = … }` makes auth's value
+      // "psk; id = …" ("invalid value for: auth"). Each setting MUST be on its own line inside the block.
+      '    local {',
+      '      auth = psk',
+      `      id = ${selfIp}`,
+      '    }',
+      '    remote {',
+      '      auth = psk',
+      `      id = ${peerIp}`,
+      '    }',
       '    children {',
       `      ${conn} {`,
       `        local_ts = ${selfTs}`,
@@ -213,20 +223,24 @@ export class VpnService implements OnModuleInit {
     const cred = await this.sshCred(host);
     if (!cred) throw new Error(`No SSH credential for ${host} — add it in Credential Vault.`);
     const b64 = Buffer.from(conf).toString('base64');
-    const fwd = siteToSite ? `sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf; ` : '';
+    // Cloud VMs log in as a sudoer (ubuntu/ec2-user/…), not root — prefix privileged steps with sudo when
+    // not already root. `$S env VAR=…` form so the env var survives sudo (sudo VAR=… treats VAR as a command).
+    const S = `S=''; [ "$(id -u)" != "0" ] && S='sudo'; `;
+    const fwd = siteToSite ? `$S sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' | $S tee -a /etc/sysctl.conf >/dev/null; ` : '';
     const cmd =
+      S +
       `command -v swanctl >/dev/null 2>&1 || { ` +
-      `  if command -v apt-get >/dev/null 2>&1; then apt-get update -y >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y strongswan strongswan-swanctl >/dev/null 2>&1; ` +
-      `  elif command -v dnf >/dev/null 2>&1; then dnf install -y strongswan >/dev/null 2>&1; ` +
-      `  elif command -v yum >/dev/null 2>&1; then yum install -y strongswan >/dev/null 2>&1; fi; }; ` +
+      `  if command -v apt-get >/dev/null 2>&1; then $S apt-get update -y >/dev/null 2>&1; $S env DEBIAN_FRONTEND=noninteractive apt-get install -y strongswan strongswan-swanctl >/dev/null 2>&1; ` +
+      `  elif command -v dnf >/dev/null 2>&1; then $S dnf install -y strongswan >/dev/null 2>&1; ` +
+      `  elif command -v yum >/dev/null 2>&1; then $S yum install -y strongswan >/dev/null 2>&1; fi; }; ` +
       `command -v swanctl >/dev/null 2>&1 || { echo MCMF_NO_SWANCTL; exit 11; }; ` +
       `${fwd}` +
-      `mkdir -p /etc/swanctl/conf.d; echo ${b64} | base64 -d > /etc/swanctl/conf.d/${conn}.conf; chmod 600 /etc/swanctl/conf.d/${conn}.conf; ` +
-      `grep -q 'include conf.d' /etc/swanctl/swanctl.conf 2>/dev/null || echo 'include conf.d/*.conf' >> /etc/swanctl/swanctl.conf; ` +
-      `systemctl enable --now strongswan-swanctl >/dev/null 2>&1 || systemctl enable --now strongswan >/dev/null 2>&1 || ipsec start >/dev/null 2>&1 || true; ` +
-      `swanctl --load-all >/dev/null 2>&1 || true; ` +
-      `${initiate ? `swanctl --initiate --child ${conn} >/dev/null 2>&1 || true; ` : ''}` +
-      `sleep 2; swanctl --list-sas 2>/dev/null | head -20; echo MCMF_VPN_DONE`;
+      `$S mkdir -p /etc/swanctl/conf.d; echo ${b64} | base64 -d | $S tee /etc/swanctl/conf.d/${conn}.conf >/dev/null; $S chmod 600 /etc/swanctl/conf.d/${conn}.conf; ` +
+      `grep -q 'include conf.d' /etc/swanctl/swanctl.conf 2>/dev/null || echo 'include conf.d/*.conf' | $S tee -a /etc/swanctl/swanctl.conf >/dev/null; ` +
+      `$S systemctl enable --now strongswan-swanctl >/dev/null 2>&1 || $S systemctl enable --now strongswan >/dev/null 2>&1 || $S ipsec start >/dev/null 2>&1 || true; ` +
+      `$S swanctl --load-all >/dev/null 2>&1 || true; ` +
+      `${initiate ? `$S swanctl --initiate --child ${conn} >/dev/null 2>&1 || true; ` : ''}` +
+      `sleep 2; $S swanctl --list-sas 2>/dev/null | head -20; echo MCMF_VPN_DONE`;
     const r = await sshRun(host, cred.port, cred.username, cred.password, cmd, 180_000);
     const out = (r.stdout || '').trim();
     if (/MCMF_NO_SWANCTL/.test(out)) throw new Error(`strongSwan (swanctl) could not be installed on ${host} — install 'strongswan' + 'strongswan-swanctl' and retry.`);
@@ -270,7 +284,7 @@ export class VpnService implements OnModuleInit {
     const l = await (this.prisma as any).vpnLink.findUnique({ where: { id } }).catch(() => null);
     if (!l) throw new BadRequestException('VPN link not found');
     const conn = this.connName(l.id);
-    const kill = `swanctl --terminate --ike ${conn} >/dev/null 2>&1 || true; rm -f /etc/swanctl/conf.d/${conn}.conf; swanctl --load-all >/dev/null 2>&1 || true; echo MCMF_VPN_DOWN`;
+    const kill = `S=''; [ "$(id -u)" != "0" ] && S='sudo'; $S swanctl --terminate --ike ${conn} >/dev/null 2>&1 || true; $S rm -f /etc/swanctl/conf.d/${conn}.conf; $S swanctl --load-all >/dev/null 2>&1 || true; echo MCMF_VPN_DOWN`;
     for (const host of [l.aHost, l.bManual ? '' : l.bHost].filter(Boolean)) {
       const cred = await this.sshCred(host);
       if (cred) await sshRun(host, cred.port, cred.username, cred.password, kill, 60_000).catch(() => undefined);
@@ -286,7 +300,7 @@ export class VpnService implements OnModuleInit {
     const cred = await this.sshCred(l.aHost);
     if (!cred) throw new BadRequestException(`No SSH credential for ${l.aHost}.`);
     const conn = this.connName(l.id);
-    const r = await sshRun(l.aHost, cred.port, cred.username, cred.password, `swanctl --list-sas --ike ${conn} 2>/dev/null | head -30; echo MCMF_END`, 30_000).catch(() => ({ stdout: '' }));
+    const r = await sshRun(l.aHost, cred.port, cred.username, cred.password, `S=''; [ "$(id -u)" != "0" ] && S='sudo'; $S swanctl --list-sas --ike ${conn} 2>/dev/null | head -30; echo MCMF_END`, 30_000).catch(() => ({ stdout: '' }));
     const out = (r.stdout || '').trim();
     const up = /ESTABLISHED|INSTALLED/.test(out);
     await (this.prisma as any).vpnLink.update({ where: { id }, data: { status: up ? 'up' : 'down', lastStatus: out.slice(0, 1500), lastCheckAt: new Date() } }).catch(() => undefined);

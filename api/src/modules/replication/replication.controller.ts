@@ -63,6 +63,18 @@ export class ReplicationController {
   }
 
   @Roles('admin', 'operator')
+  @Post(':id/test')
+  test(@Param('id') id: string) {
+    return this.service.test(id);
+  }
+
+  @Roles('admin', 'operator')
+  @Post(':id/stop')
+  stop(@Param('id') id: string) {
+    return this.service.stop(id);
+  }
+
+  @Roles('admin', 'operator')
   @Post(':id/promote')
   promote(@Param('id') id: string, @Body() body: { to?: 'primary' | 'secondary' | 'tertiary' }) {
     return this.service.promote(id, body?.to ?? 'secondary');

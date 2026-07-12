@@ -417,38 +417,62 @@ export class AzureConnector implements CloudConnector {
     const m = String(opts.networkId).match(/resourceGroups\/([^/]+)\/providers\/Microsoft\.Network\/virtualNetworks\/([^/?]+)/i);
     if (!m) throw new Error('Azure fabric requires the full ARM id of the VNet as networkId.');
     const rg = m[1], vnet = m[2];
-    const arm = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${rg}/providers/Microsoft.Network`;
+    // armId = RELATIVE ARM resource id (starts with /subscriptions/) — required inside request-body `id`
+    // references. arm = the full management URL used only for the fetch() endpoint. Mixing them up makes
+    // Azure reject the body: "SubscriptionsPrefixMissingInJsonReferenceId / id has to start with /subscriptions/".
+    const armId = `/subscriptions/${subscriptionId}/resourceGroups/${rg}/providers/Microsoft.Network`;
+    const arm = `https://management.azure.com${armId}`;
     const av = 'api-version=2023-09-01';
     const h = { authorization: `Bearer ${token}`, 'content-type': 'application/json' } as any;
-    const put = (url: string, body: any) => fetch(`${url}?${av}`, { method: 'PUT', headers: h, body: JSON.stringify(body) });
-    await put(`${arm}/publicIPAddresses/${opts.name}-pip`, { location: opts.region, sku: { name: 'Standard' }, properties: { publicIPAllocationMethod: 'Static' } });
+    // Checked PUT: Azure resource creates return 200/201 (sync) or 202 (async, long-running). Anything else
+    // is a real failure — surface Azure's actual error instead of silently continuing (which later showed up
+    // as a mysterious "gateway not-found"). PUTs are idempotent, so a retry/re-Arm is safe.
+    const put = async (url: string, body: any, label: string) => {
+      const r = await fetch(`${url}?${av}`, { method: 'PUT', headers: h, body: JSON.stringify(body) });
+      if (![200, 201, 202].includes(r.status)) {
+        const t = await r.text().catch(() => '');
+        throw new Error(`Azure ${label} create failed (${r.status}): ${t.replace(/\s+/g, ' ').slice(0, 400)}`);
+      }
+      return r;
+    };
+    // AZ VPN gateway SKUs require a ZONE-REDUNDANT Standard public IP (VmssVpnGatewayPublicIpsMustHaveZonesConfigured).
+    // zones is immutable on a PIP, so a fabric whose PIP was created zone-less must be torn down before re-Arm.
+    await put(`${arm}/publicIPAddresses/${opts.name}-pip`, { location: opts.region, sku: { name: 'Standard' }, zones: ['1', '2', '3'], properties: { publicIPAllocationMethod: 'Static' } }, 'gateway public IP');
     let ip = '';
     for (let i = 0; i < 15 && !ip; i++) {
       const r = await fetch(`${arm}/publicIPAddresses/${opts.name}-pip?${av}`, { headers: h });
       if (r.ok) ip = (((await r.json()) as any)?.properties?.ipAddress) || '';
       if (!ip) await new Promise((s) => setTimeout(s, 3000));
     }
-    await put(`${arm}/virtualNetworks/${vnet}/subnets/GatewaySubnet`, { properties: { addressPrefix: opts.gwSubnetCidr } });
-    const pipId = `${arm}/publicIPAddresses/${opts.name}-pip`;
-    const subnetId = `${arm}/virtualNetworks/${vnet}/subnets/GatewaySubnet`;
+    await put(`${arm}/virtualNetworks/${vnet}/subnets/GatewaySubnet`, { properties: { addressPrefix: opts.gwSubnetCidr } }, 'GatewaySubnet');
+    const pipId = `${armId}/publicIPAddresses/${opts.name}-pip`;
+    const subnetId = `${armId}/virtualNetworks/${vnet}/subnets/GatewaySubnet`;
     await put(`${arm}/virtualNetworkGateways/${opts.name}`, {
       location: opts.region,
-      properties: { gatewayType: 'Vpn', vpnType: 'RouteBased', sku: { name: 'VpnGw1', tier: 'VpnGw1' }, ipConfigurations: [{ name: 'default', properties: { privateIPAllocationMethod: 'Dynamic', subnet: { id: subnetId }, publicIPAddress: { id: pipId } } }] },
-    });
+      // Azure deprecated the non-AZ VpnGw SKUs (NonAzSkusNotAllowedForVPNGateway) — only the AZ SKUs
+      // (VpnGw1AZ…VpnGw5AZ) can be created now. AZ SKUs require a Standard-SKU public IP (already used above).
+      properties: { gatewayType: 'Vpn', vpnType: 'RouteBased', sku: { name: 'VpnGw1AZ', tier: 'VpnGw1AZ' }, ipConfigurations: [{ name: 'default', properties: { privateIPAllocationMethod: 'Dynamic', subnet: { id: subnetId }, publicIPAddress: { id: pipId } } }] },
+    }, 'VPN gateway');
     if (!ip) throw new Error('Azure did not assign a Public IP (check quota/permissions).');
     return { gatewayId: opts.name, publicIp: ip };
   }
 
-  /** Poll the gateway provisioningState; true when Succeeded. Azure gateways take ~30-45 minutes. */
-  async fabricGatewayReady(credentials: ProviderCredentials, opts: { networkId: string; name: string }): Promise<boolean> {
+  /**
+   * Poll the gateway provisioningState. Azure gateways take ~30-45 minutes. Returns the live state so the
+   * caller can (a) show progress and (b) fail fast on a TERMINAL state (Failed/Canceled) instead of waiting
+   * forever — a bare "not Succeeded === keep waiting" loop never ends if provisioning failed.
+   */
+  async fabricGatewayReady(credentials: ProviderCredentials, opts: { networkId: string; name: string }): Promise<{ ready: boolean; state: string; terminal: boolean }> {
     const { subscriptionId } = this.require(credentials);
     const token = await getAzureToken(credentials);
     const m = String(opts.networkId).match(/resourceGroups\/([^/]+)\//i);
-    if (!m) return false;
+    if (!m) return { ready: false, state: 'bad-network-id', terminal: true };
     const url = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${m[1]}/providers/Microsoft.Network/virtualNetworkGateways/${opts.name}?api-version=2023-09-01`;
     const r = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
-    if (!r.ok) return false;
-    return (((await r.json()) as any)?.properties?.provisioningState) === 'Succeeded';
+    if (r.status === 404) return { ready: false, state: 'not-found', terminal: true }; // gateway was deleted / never created
+    if (!r.ok) return { ready: false, state: `http-${r.status}`, terminal: false }; // transient (throttle/token) — keep polling
+    const state = String(((await r.json()) as any)?.properties?.provisioningState || 'Unknown');
+    return { ready: state === 'Succeeded', state, terminal: /^(Failed|Canceled|Cancelled)$/i.test(state) };
   }
 
   /** Create a Local Network Gateway (peer) and an IPsec connection with the shared key. */
@@ -458,16 +482,27 @@ export class AzureConnector implements CloudConnector {
     const m = String(opts.networkId).match(/resourceGroups\/([^/]+)\//i);
     if (!m) throw new Error('Azure fabric requires the full ARM id of the VNet as networkId.');
     const rg = m[1];
-    const arm = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${rg}/providers/Microsoft.Network`;
+    const armId = `/subscriptions/${subscriptionId}/resourceGroups/${rg}/providers/Microsoft.Network`; // relative id for body refs
+    const arm = `https://management.azure.com${armId}`; // full url for fetch
     const av = 'api-version=2023-09-01';
     const h = { authorization: `Bearer ${token}`, 'content-type': 'application/json' } as any;
     const put = (url: string, body: any) => fetch(`${url}?${av}`, { method: 'PUT', headers: h, body: JSON.stringify(body) });
-    await put(`${arm}/localNetworkGateways/${opts.name}-lgw`, { location: opts.region, properties: { gatewayIpAddress: opts.peerIp, localNetworkAddressSpace: { addressPrefixes: [opts.peerCidr] } } });
+    const lgwUrl = `${arm}/localNetworkGateways/${opts.name}-lgw`;
+    await put(lgwUrl, { location: opts.region, properties: { gatewayIpAddress: opts.peerIp, localNetworkAddressSpace: { addressPrefixes: [opts.peerCidr] } } });
+    // The lgw provisions async; creating the connection before it's Succeeded fails with
+    // ReferencedResourceNotProvisioned. Poll it to Succeeded (a few seconds) before wiring the connection.
+    for (let i = 0; i < 20; i++) {
+      const lr = await fetch(`${lgwUrl}?${av}`, { headers: h });
+      const state = lr.ok ? String((((await lr.json()) as any)?.properties?.provisioningState) || '') : '';
+      if (state === 'Succeeded') break;
+      if (/Failed|Canceled/i.test(state)) throw new Error(`Azure local network gateway provisioning ${state}.`);
+      await new Promise((s) => setTimeout(s, 3000));
+    }
     const r = await put(`${arm}/connections/${opts.name}-conn`, {
       location: opts.region,
-      properties: { connectionType: 'IPsec', sharedKey: opts.psk, virtualNetworkGateway1: { id: `${arm}/virtualNetworkGateways/${opts.gatewayId}` }, localNetworkGateway2: { id: `${arm}/localNetworkGateways/${opts.name}-lgw` } },
+      properties: { connectionType: 'IPsec', sharedKey: opts.psk, virtualNetworkGateway1: { id: `${armId}/virtualNetworkGateways/${opts.gatewayId}` }, localNetworkGateway2: { id: `${armId}/localNetworkGateways/${opts.name}-lgw` } },
     });
-    if (!r.ok) throw new Error(`Azure connection create failed (${r.status}) — the VPN gateway may still be provisioning.`);
+    if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`Azure connection create failed (${r.status}): ${t.replace(/\s+/g, ' ').slice(0, 300)}`); }
     return { connId: `${rg}/${opts.name}-conn`, outsideIps: [] };
   }
 

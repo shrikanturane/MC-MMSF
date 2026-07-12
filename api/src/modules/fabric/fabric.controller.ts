@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
 import { Roles } from '../../auth/roles.decorator';
 import { FabricService } from './fabric.service';
 
@@ -15,6 +15,12 @@ export class FabricController {
   @Post()
   create(@Body() body: any) {
     return this.service.create(body ?? {});
+  }
+
+  @Roles('admin', 'operator')
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() body: any) {
+    return this.service.update(id, body ?? {});
   }
 
   @Roles('admin', 'operator')

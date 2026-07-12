@@ -51,10 +51,34 @@ export class FabricService implements OnModuleInit {
     }));
   }
 
+  /**
+   * Reject a region that clearly doesn't belong to its provider (the #1 fabric foot-gun: switching the
+   * cloud in the create dialog but leaving the other cloud's default region). Azure locations have NO
+   * dashes (eastus); AWS/GCP regions do (us-east-1 / us-central1). Fails fast with a friendly message
+   * BEFORE the cloud API returns a cryptic 400. Returns an error string, or null when it looks valid.
+   */
+  private regionError(provider: string, region: string): string | null {
+    const r = String(region || '').trim();
+    if (!r) return `${provider.toUpperCase()} region is required.`;
+    if (provider === 'azure') {
+      if (r.includes('-') || !/^[a-z][a-z0-9]+$/.test(r)) return `"${r}" is not a valid Azure location — Azure locations have no dashes (e.g. eastus, westeurope, centralindia). It looks like a ${/^[a-z]{2}-[a-z]+-\d+$/.test(r) ? 'AWS' : 'non-Azure'} region — did you swap the region with the other side?`;
+    } else if (provider === 'aws') {
+      if (!/^[a-z]{2}-[a-z]+-\d+$/.test(r)) return `"${r}" is not a valid AWS region — AWS regions look like us-east-1, eu-west-2, ap-southeast-1${/^[a-z][a-z0-9]+$/.test(r) ? ' (that looks like an Azure location — did you swap the region with the other side?)' : ''}.`;
+    } else if (provider === 'gcp') {
+      if (!/^[a-z]+-[a-z]+\d+$/.test(r)) return `"${r}" is not a valid GCP region — GCP regions look like us-central1, europe-west1, asia-south1.`;
+    }
+    return null;
+  }
+
   async create(body: any) {
     const prov = (p: string) => (['aws', 'azure', 'gcp'].includes(p) ? p : 'aws');
     const name = String(body.name || 'fabric').slice(0, 80);
-    const psk = String(body.psk || '').trim() || randomBytes(20).toString('hex');
+    // AWS VPN tunnels require the PSK to be 8-64 chars of [A-Za-z0-9._] and NOT start with 0. A bare hex
+    // string can start with '0' ("Value for parameter PreSharedKey is invalid"). Prefix a letter to be safe.
+    const psk = String(body.psk || '').trim() || ('k' + randomBytes(20).toString('hex'));
+    const [ap, bp] = [prov(body.aProvider), prov(body.bProvider)];
+    const aErr = this.regionError(ap, body.aRegion); if (aErr) throw new BadRequestException(`Side A (${ap.toUpperCase()}): ${aErr}`);
+    const bErr = this.regionError(bp, body.bRegion); if (bErr) throw new BadRequestException(`Side B (${bp.toUpperCase()}): ${bErr}`);
     return (this.prisma as any).networkFabric.create({
       data: {
         name, psk: encryptJson(psk),
@@ -69,6 +93,9 @@ export class FabricService implements OnModuleInit {
     const f = await (this.prisma as any).networkFabric.findUnique({ where: { id } }).catch(() => null);
     if (!f) throw new BadRequestException('fabric not found');
     if (f.aProvider === f.bProvider) throw new BadRequestException('Pick two DIFFERENT clouds for a cross-cloud fabric.');
+    // Region sanity BEFORE any billable/cloud call (catches drafts created before this validation existed).
+    const aErr = this.regionError(f.aProvider, f.aRegion); if (aErr) throw new BadRequestException(`Side A (${String(f.aProvider).toUpperCase()}): ${aErr}`);
+    const bErr = this.regionError(f.bProvider, f.bRegion); if (bErr) throw new BadRequestException(`Side B (${String(f.bProvider).toUpperCase()}): ${bErr}`);
     if (!(await this.credsFor(f.aProvider))) throw new BadRequestException(`Connect a ${f.aProvider.toUpperCase()} cloud account first.`);
     if (!(await this.credsFor(f.bProvider))) throw new BadRequestException(`Connect a ${f.bProvider.toUpperCase()} cloud account first.`);
     await (this.prisma as any).networkFabric.update({ where: { id }, data: { armed: true, status: 'provisioning', stage: 'net_a', lastError: '' } });
@@ -76,7 +103,40 @@ export class FabricService implements OnModuleInit {
     return { ok: true };
   }
 
+  /**
+   * Edit a fabric's definition (providers, regions, CIDRs, name, PSK). Only while it's a DRAFT or has
+   * ERRORED — never mid-provision or once up (those hold live cloud state; tear down first). Lets an
+   * operator fix a bad region without deleting + recreating the whole fabric.
+   */
+  async update(id: string, body: any) {
+    const f = await (this.prisma as any).networkFabric.findUnique({ where: { id } }).catch(() => null);
+    if (!f) throw new BadRequestException('fabric not found');
+    if (f.armed && !['error', 'draft'].includes(f.status)) throw new BadRequestException(`This fabric is "${f.status}" — tear it down before editing (it holds live cloud resources).`);
+    const prov = (p: string, fallback: string) => (['aws', 'azure', 'gcp'].includes(p) ? p : fallback);
+    const data: any = {};
+    if (body.name !== undefined) data.name = String(body.name).slice(0, 80);
+    if (typeof body.psk === 'string' && body.psk.trim()) data.psk = encryptJson(body.psk.trim());
+    if (body.aProvider !== undefined) data.aProvider = prov(body.aProvider, f.aProvider);
+    if (body.bProvider !== undefined) data.bProvider = prov(body.bProvider, f.bProvider);
+    for (const k of ['aRegion', 'aCidr', 'aSubnetCidr', 'bRegion', 'bCidr', 'bSubnetCidr'] as const) if (body[k] !== undefined) data[k] = String(body[k]).slice(0, 40);
+    // validate the resulting (merged) providers/regions
+    const merged = { ...f, ...data };
+    const aErr = this.regionError(merged.aProvider, merged.aRegion); if (aErr) throw new BadRequestException(`Side A (${String(merged.aProvider).toUpperCase()}): ${aErr}`);
+    const bErr = this.regionError(merged.bProvider, merged.bRegion); if (bErr) throw new BadRequestException(`Side B (${String(merged.bProvider).toUpperCase()}): ${bErr}`);
+    if (merged.aProvider === merged.bProvider) throw new BadRequestException('Pick two DIFFERENT clouds for a cross-cloud fabric.');
+    // editing an errored fabric resets it to a clean draft so it can be re-armed
+    if (f.status === 'error') { data.status = 'draft'; data.armed = false; data.lastError = ''; }
+    await (this.prisma as any).networkFabric.update({ where: { id }, data });
+    return { ok: true };
+  }
+
   async retry(id: string) {
+    const f = await (this.prisma as any).networkFabric.findUnique({ where: { id } }).catch(() => null);
+    if (f) {
+      // Re-validate before re-running — a raw cloud 400 (e.g. swapped region) won't fix itself on retry.
+      const aErr = this.regionError(f.aProvider, f.aRegion); if (aErr) throw new BadRequestException(`Side A (${String(f.aProvider).toUpperCase()}): ${aErr} — fix it in Edit, then retry.`);
+      const bErr = this.regionError(f.bProvider, f.bRegion); if (bErr) throw new BadRequestException(`Side B (${String(f.bProvider).toUpperCase()}): ${bErr} — fix it in Edit, then retry.`);
+    }
     await (this.prisma as any).networkFabric.update({ where: { id }, data: { status: 'provisioning', lastError: '' } }).catch(() => undefined);
     this.advance(id).catch(() => undefined);
     return { ok: true };
@@ -106,7 +166,7 @@ export class FabricService implements OnModuleInit {
           connId: side === 'a' ? f.aConnId : f.bConnId,
           gatewayId: side === 'a' ? f.aGatewayId : f.bGatewayId,
           networkId: side === 'a' ? f.aNetworkId : f.bNetworkId,
-          name: `${f.name}-${side}`.slice(0, 40),
+          name: this.safeName(f.name, side),
           region: side === 'a' ? f.aRegion : f.bRegion,
         });
         results.push(`${side.toUpperCase()} (${provider}): ${(out || []).join('; ')}`);
@@ -159,13 +219,25 @@ export class FabricService implements OnModuleInit {
     }
   }
 
+  /**
+   * A cloud-safe resource name derived from the (free-text) fabric name. Azure/GCP reject spaces and
+   * most punctuation ("invalid network name"), and GCP requires lowercase starting with a letter. Produce
+   * lowercase [a-z0-9-], collapse/trim dashes, ensure it starts with a letter — valid on AWS/Azure/GCP.
+   */
+  private safeName(base: string, suffix = ''): string {
+    let s = String(base || 'mcmf').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');
+    if (!/^[a-z]/.test(s)) s = `mcmf-${s}`;
+    s = s.replace(/^-+|-+$/g, '').slice(0, 30) || 'mcmf';
+    return `${s}${suffix ? `-${suffix}` : ''}`.replace(/-+$/g, '').slice(0, 40);
+  }
+
   private async provisionNet(f: any, side: Side): Promise<string> {
     const provider = side === 'a' ? f.aProvider : f.bProvider;
     const creds = await this.credsFor(provider);
     if (!creds) throw new Error(`No connected ${provider.toUpperCase()} account.`);
     const conn = getConnector(provider) as any;
     if (typeof conn.provision !== 'function') throw new Error(`${provider} connector cannot provision a network.`);
-    const r = await conn.provision(creds, { kind: 'network', name: `${f.name}-${side}`.slice(0, 40), region: side === 'a' ? f.aRegion : f.bRegion, cidr: side === 'a' ? f.aCidr : f.bCidr, subnetCidr: side === 'a' ? f.aSubnetCidr : f.bSubnetCidr });
+    const r = await conn.provision(creds, { kind: 'network', name: this.safeName(f.name, side), region: side === 'a' ? f.aRegion : f.bRegion, cidr: side === 'a' ? f.aCidr : f.bCidr, subnetCidr: side === 'a' ? f.aSubnetCidr : f.bSubnetCidr });
     if (!r?.externalId) throw new Error(`${provider} network provisioning returned no id: ${r?.detail ?? ''}`);
     return String(r.externalId);
   }
@@ -178,13 +250,33 @@ export class FabricService implements OnModuleInit {
     if (typeof conn.fabricGateway !== 'function') throw new Error(`${provider} connector does not implement fabricGateway.`);
     const region = side === 'a' ? f.aRegion : f.bRegion;
     const networkId = side === 'a' ? f.aNetworkId : f.bNetworkId;
-    return conn.fabricGateway(creds, { networkId, region, name: `${f.name}-${side}-gw`.slice(0, 40), gwSubnet: this.gwSubnet(side === 'a' ? f.aCidr : f.bCidr), gwSubnetCidr: this.gwSubnet(side === 'a' ? f.aCidr : f.bCidr) });
+    return conn.fabricGateway(creds, { networkId, region, name: this.safeName(f.name, `${side}-gw`), gwSubnet: this.gwSubnet(side === 'a' ? f.aCidr : f.bCidr), gwSubnetCidr: this.gwSubnet(side === 'a' ? f.aCidr : f.bCidr) });
   }
 
   /** Create both connections. AWS side first (its outside IP only exists after its connection). Returns true when done. */
   private async connect(f: any): Promise<boolean> {
     // fresh copy (gateway IPs may have been set on a prior tick)
     f = await (this.prisma as any).networkFabric.findUnique({ where: { id: f.id } });
+    // AWS assigns a VPN connection's tunnel OUTSIDE IP a few minutes AFTER creation, so the IP is usually
+    // empty at fabricConnection() time. Poll for it here across ticks — otherwise the peer side waits on an
+    // AWS gateway IP that's already-connected-but-not-yet-reported and the fabric hangs at conn forever.
+    for (const side of ['a', 'b'] as Side[]) {
+      const provider = side === 'a' ? f.aProvider : f.bProvider;
+      const connId = side === 'a' ? f.aConnId : f.bConnId;
+      const gwIp = side === 'a' ? f.aGatewayIp : f.bGatewayIp;
+      if (provider !== 'aws' || !connId || gwIp) continue;
+      const creds = await this.credsFor('aws');
+      const c2 = getConnector('aws') as any;
+      if (!creds || typeof c2.fabricConnectionOutsideIps !== 'function') continue;
+      const ips: string[] = await c2.fabricConnectionOutsideIps(creds, { connId, region: side === 'a' ? f.aRegion : f.bRegion }).catch(() => []);
+      if (ips[0]) {
+        await (this.prisma as any).networkFabric.update({ where: { id: f.id }, data: side === 'a' ? { aGatewayIp: ips[0] } : { bGatewayIp: ips[0] } });
+        f = await (this.prisma as any).networkFabric.findUnique({ where: { id: f.id } });
+        await this.step(f.id, 'conn', 'ok', `${side.toUpperCase()} outside IP ${ips[0]}`);
+      } else {
+        await this.step(f.id, 'conn', 'wait', `waiting for AWS to assign side ${side.toUpperCase()} tunnel outside IP (a few min)`);
+      }
+    }
     const sides: Side[] = f.aProvider === 'aws' ? ['a', 'b'] : f.bProvider === 'aws' ? ['b', 'a'] : ['a', 'b'];
     for (const side of sides) {
       const other: Side = side === 'a' ? 'b' : 'a';
@@ -198,14 +290,20 @@ export class FabricService implements OnModuleInit {
       const conn = getConnector(provider) as any;
       // Azure connection needs its gateway fully provisioned (~30-45 min) — poll and wait across ticks.
       if (provider === 'azure' && typeof conn.fabricGatewayReady === 'function') {
-        const ready = await conn.fabricGatewayReady(creds, { networkId: side === 'a' ? f.aNetworkId : f.bNetworkId, name: side === 'a' ? f.aGatewayId : f.bGatewayId });
-        if (!ready) { await (this.prisma as any).networkFabric.update({ where: { id: f.id }, data: { status: 'connecting', lastError: 'Azure VPN gateway still provisioning (~30-45 min)…' } }).catch(() => undefined); await this.step(f.id, 'conn', 'wait', 'Azure gateway provisioning'); return false; }
+        const rs: any = await conn.fabricGatewayReady(creds, { networkId: side === 'a' ? f.aNetworkId : f.bNetworkId, name: side === 'a' ? f.aGatewayId : f.bGatewayId });
+        // back-compat: older adapters returned a bare boolean
+        const ready = typeof rs === 'object' && rs ? !!rs.ready : !!rs;
+        const state = typeof rs === 'object' && rs ? String(rs.state || '') : ready ? 'Succeeded' : 'Provisioning';
+        const terminal = typeof rs === 'object' && rs ? !!rs.terminal : false;
+        // A TERMINAL state (Failed/Canceled/not-found) never becomes ready — fail fast instead of waiting forever.
+        if (terminal) throw new Error(`Azure VPN gateway is "${state}" — it will not finish. Tear down and re-Arm.`);
+        if (!ready) { await (this.prisma as any).networkFabric.update({ where: { id: f.id }, data: { status: 'connecting', lastError: `Azure VPN gateway provisioning (state=${state}, ~30-45 min)…` } }).catch(() => undefined); await this.step(f.id, 'conn', 'wait', `Azure gateway ${state}`); return false; }
       }
       if (typeof conn.fabricConnection !== 'function') throw new Error(`${provider} connector does not implement fabricConnection.`);
       let dbpsk = ''; try { dbpsk = f.psk ? decryptJson<string>(f.psk) : ''; } catch { /* */ }
       const r = await conn.fabricConnection(creds, {
         gatewayId: side === 'a' ? f.aGatewayId : f.bGatewayId, region: side === 'a' ? f.aRegion : f.bRegion, networkId: side === 'a' ? f.aNetworkId : f.bNetworkId,
-        peerIp, peerCidr: other === 'a' ? f.aCidr : f.bCidr, localCidr: side === 'a' ? f.aCidr : f.bCidr, psk: dbpsk, name: `${f.name}-${side}`.slice(0, 40),
+        peerIp, peerCidr: other === 'a' ? f.aCidr : f.bCidr, localCidr: side === 'a' ? f.aCidr : f.bCidr, psk: dbpsk, name: this.safeName(f.name, side),
       });
       const patch: any = side === 'a' ? { aConnId: r.connId } : { bConnId: r.connId };
       // AWS: its own public IP = the connection's tunnel outside IP, now available for the peer's connection.

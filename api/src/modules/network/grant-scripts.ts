@@ -36,6 +36,7 @@ cat > /tmp/mcmf-prov.json <<'JSON'
   "Action": ["ec2:CreateVpc","ec2:DeleteVpc","ec2:CreateSubnet","ec2:DeleteSubnet",
              "ec2:CreateTags","ec2:DeleteTags",
              "ec2:RunInstances","ec2:TerminateInstances",
+             "ec2:CreateSecurityGroup","ec2:DeleteSecurityGroup","ec2:AuthorizeSecurityGroupIngress","ec2:RevokeSecurityGroupIngress","ec2:DescribeSecurityGroups",
              "ec2:CreateVolume","ec2:DeleteVolume","ec2:AttachVolume",
              "ec2:CreateVpnGateway","ec2:AttachVpnGateway","ec2:DetachVpnGateway","ec2:DeleteVpnGateway",
              "ec2:CreateCustomerGateway","ec2:DeleteCustomerGateway",

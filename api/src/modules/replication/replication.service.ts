@@ -75,9 +75,34 @@ export class ReplicationService implements OnModuleInit {
     return { username: c.username, password, port: 22 };
   }
 
-  private hostOf(r: any): string {
+  private hostOf(r: any, preferPublic = false): string {
     const p = (r?.properties ?? {}) as any;
+    // Cross-cloud replication can only route over PUBLIC addresses — a private IP (10.x / 172.31.x)
+    // is unreachable from the other cloud (or from an off-network MCMF). Same-cloud prefers private.
+    if (preferPublic) return p.publicIp || p.ip || p.ipAddress || p.privateIp || r?.name || '';
     return p.privateIp || p.ip || p.publicIp || p.ipAddress || r?.name || '';
+  }
+
+  /**
+   * Resolve the OS ('windows' | 'linux') of one endpoint. The operator's explicit choice stored on the
+   * set wins; otherwise infer from the resource (provider === 'windows', or an os/osVersion property).
+   */
+  private async endpointOs(set: any, role: 'primary' | 'secondary' | 'tertiary'): Promise<'windows' | 'linux'> {
+    const stored = String(set?.[`${role}Os`] || '').toLowerCase();
+    if (stored === 'windows' || stored === 'linux') return stored;
+    const id = set?.[`${role}Id`];
+    if (id) {
+      const r = await this.prisma.resource.findUnique({ where: { id }, select: { provider: true, properties: true } }).catch(() => null);
+      const props: any = r?.properties ?? {};
+      if (r?.provider === 'windows' || /win/i.test(String(props.os ?? '')) || /win/i.test(String(props.osVersion ?? ''))) return 'windows';
+    }
+    return 'linux';
+  }
+
+  /** Infer OS from a resource row (used at create/update time to default the stored OS field). */
+  private osOfResource(r: any): 'windows' | 'linux' {
+    const props: any = r?.properties ?? {};
+    return r?.provider === 'windows' || /win/i.test(String(props.os ?? '')) || /win/i.test(String(props.osVersion ?? '')) ? 'windows' : 'linux';
   }
 
   async list() {
@@ -95,7 +120,8 @@ export class ReplicationService implements OnModuleInit {
       primaryId: s.primaryId, primaryName: s.primaryName, primaryHost: s.primaryHost,
       secondaryId: s.secondaryId, secondaryName: s.secondaryName, secondaryHost: s.secondaryHost,
       tertiaryId: s.tertiaryId, tertiaryName: s.tertiaryName, tertiaryHost: s.tertiaryHost,
-      sourcePath: s.sourcePath, targetPath: s.targetPath, dbEngine: s.dbEngine, dbName: s.dbName, dockerVolumes: s.dockerVolumes, driver: s.driver, intervalMin: s.intervalMin, intervalSec: s.intervalSec,
+      primaryOs: s.primaryOs, secondaryOs: s.secondaryOs, tertiaryOs: s.tertiaryOs,
+      sourcePath: s.sourcePath, targetPath: s.targetPath, dbEngine: s.dbEngine, dbName: s.dbName, dbUser: s.dbUser, dockerVolumes: s.dockerVolumes, driver: s.driver, intervalMin: s.intervalMin, intervalSec: s.intervalSec,
       blockDevice: s.blockDevice, blockDeviceB: s.blockDeviceB, drbdPort: s.drbdPort, drbdMinor: s.drbdMinor, drbdMount: s.drbdMount,
       enabled: s.enabled, status: this.running.has(s.id) ? 'running' : s.status, state: s.state,
       lastError: s.lastError,
@@ -108,19 +134,27 @@ export class ReplicationService implements OnModuleInit {
 
   async create(body: any) {
     const ids = [body.primaryId, body.secondaryId, body.tertiaryId].filter(Boolean);
-    const res = await this.prisma.resource.findMany({ where: { id: { in: ids } }, select: { id: true, name: true, properties: true } });
+    const res = await this.prisma.resource.findMany({ where: { id: { in: ids } }, select: { id: true, name: true, provider: true, properties: true } });
     const byId = new Map(res.map((r) => [r.id, r]));
     const p = byId.get(body.primaryId), s = byId.get(body.secondaryId), t = body.tertiaryId ? byId.get(body.tertiaryId) : null;
     if (!p || !s) throw new BadRequestException('Pick a primary and a secondary VM from the inventory.');
     if (p.id === s.id) throw new BadRequestException('Primary and secondary must be different VMs.');
+    // Host address per endpoint: the operator can pick the exact IP (public / private / custom) in
+    // the form — honored verbatim. If not provided, auto-resolve: cross-cloud (endpoints in different
+    // providers) prefers the PUBLIC IP (private can't route between clouds); same-cloud keeps private.
+    const crossCloud = new Set([p, s, t].filter(Boolean).map((r: any) => r.provider)).size > 1;
+    const cleanHost = (v: any) => (typeof v === 'string' && /^[A-Za-z0-9.:_-]+$/.test(v.trim()) ? v.trim() : '');
+    const host = (r: any, chosen: any) => cleanHost(chosen) || this.hostOf(r, crossCloud);
+    // OS per endpoint: honour an explicit choice ('windows'|'linux'); else infer from the resource.
+    const osOf = (r: any, chosen: any) => (/^win/i.test(String(chosen)) ? 'windows' : /^lin/i.test(String(chosen)) ? 'linux' : this.osOfResource(r));
     return this.prisma.replicationSet.create({
       data: {
         name: String(body.name || 'replication').slice(0, 80),
         dataType: ['files', 'database', 'docker', 'block'].includes(body.dataType) ? body.dataType : 'files',
         mode: ['sync', 'async', 'scheduled'].includes(body.mode) ? body.mode : 'scheduled',
-        primaryId: p.id, primaryName: p.name, primaryHost: this.hostOf(p),
-        secondaryId: s.id, secondaryName: s.name, secondaryHost: this.hostOf(s),
-        tertiaryId: t?.id ?? '', tertiaryName: t?.name ?? '', tertiaryHost: t ? this.hostOf(t) : '',
+        primaryId: p.id, primaryName: p.name, primaryHost: host(p, body.primaryHost), primaryOs: osOf(p, body.primaryOs),
+        secondaryId: s.id, secondaryName: s.name, secondaryHost: host(s, body.secondaryHost), secondaryOs: osOf(s, body.secondaryOs),
+        tertiaryId: t?.id ?? '', tertiaryName: t?.name ?? '', tertiaryHost: t ? host(t, body.tertiaryHost) : '', tertiaryOs: t ? osOf(t, body.tertiaryOs) : '',
         sourcePath: String(body.sourcePath || '').slice(0, 300),
         targetPath: String(body.targetPath || '').slice(0, 300),
         dbEngine: ['postgres', 'mysql'].includes(body.dbEngine) ? body.dbEngine : 'postgres',
@@ -142,8 +176,27 @@ export class ReplicationService implements OnModuleInit {
 
   async update(id: string, body: any) {
     const data: any = {};
-    for (const k of ['name', 'dataType', 'mode', 'sourcePath', 'targetPath'] as const) if (body[k] !== undefined) data[k] = String(body[k]).slice(0, 300);
+    const cleanHost = (v: any) => (typeof v === 'string' && /^[A-Za-z0-9.:_-]+$/.test(v.trim()) ? v.trim() : '');
+    // simple strings
+    if (body.name !== undefined) data.name = String(body.name).slice(0, 80);
+    if (body.dataType !== undefined && ['files', 'database', 'docker', 'block'].includes(body.dataType)) data.dataType = body.dataType;
+    if (body.mode !== undefined && ['sync', 'async', 'scheduled'].includes(body.mode)) data.mode = body.mode;
+    if (body.driver !== undefined) data.driver = body.driver === 'agent' ? 'agent' : 'orchestrated';
+    for (const k of ['sourcePath', 'targetPath', 'dbName', 'dbUser', 'dockerVolumes', 'blockDevice', 'blockDeviceB', 'drbdMount'] as const) if (body[k] !== undefined) data[k] = String(body[k]).slice(0, 500);
+    if (body.dbEngine !== undefined && ['postgres', 'mysql'].includes(body.dbEngine)) data.dbEngine = body.dbEngine;
+    // db password: only touch when a non-empty value is supplied (blank = leave unchanged)
+    if (typeof body.dbPassword === 'string' && body.dbPassword) data.dbPassword = encryptJson(String(body.dbPassword));
+    // hosts + OS per endpoint (the "target IP" selection)
+    for (const role of ['primary', 'secondary', 'tertiary'] as const) {
+      const hk = `${role}Host`, ok = `${role}Os`;
+      if (body[hk] !== undefined) data[hk] = cleanHost(body[hk]);
+      if (body[ok] !== undefined && /^(win|lin)/i.test(String(body[ok]))) data[ok] = /^win/i.test(String(body[ok])) ? 'windows' : 'linux';
+    }
+    // numbers
     if (body.intervalMin !== undefined) data.intervalMin = Math.max(1, Math.min(1440, Number(body.intervalMin) || 15));
+    if (body.intervalSec !== undefined) data.intervalSec = Math.max(0, Math.min(3600, Number(body.intervalSec) || 0));
+    if (body.drbdPort !== undefined) data.drbdPort = Math.max(1, Math.min(65535, Number(body.drbdPort) || 7789));
+    if (body.drbdMinor !== undefined) data.drbdMinor = Math.max(0, Math.min(255, Number(body.drbdMinor) || 0));
     if (body.enabled !== undefined) data.enabled = !!body.enabled;
     return this.prisma.replicationSet.update({ where: { id }, data });
   }
@@ -151,6 +204,87 @@ export class ReplicationService implements OnModuleInit {
   async remove(id: string) {
     await this.prisma.replicationSet.delete({ where: { id } }).catch(() => undefined);
     return { ok: true };
+  }
+
+  /** Stop a set: disable scheduling, clear any in-progress lock, mark it stopped. Data on hosts untouched. */
+  async stop(id: string) {
+    const set = await this.prisma.replicationSet.findUnique({ where: { id } });
+    if (!set) throw new BadRequestException('replication set not found');
+    this.running.delete(id);
+    await this.prisma.replicationSet.update({ where: { id }, data: { enabled: false, status: 'paused' } });
+    await this.prisma.eventLog.create({ data: { type: 'finding', severity: 'info', title: `Replication "${set.name}": stopped by operator (scheduling disabled).` } }).catch(() => undefined);
+    return { ok: true, status: 'paused' };
+  }
+
+  /**
+   * Diagnose a replication set end-to-end and report exactly where it would fail. Runs a series of
+   * checks per endpoint: credential present, MCMF->host SSH reachability (advisory for agent sets),
+   * required tools, source/target path, agent online (agent driver). Never throws — every check is a
+   * {name, target, ok, level, detail} row so the UI can show a red/amber/green report.
+   */
+  async test(id: string) {
+    const set = await this.prisma.replicationSet.findUnique({ where: { id } });
+    if (!set) throw new BadRequestException('replication set not found');
+    const checks: { name: string; target: string; ok: boolean; level: 'error' | 'warn' | 'info'; detail: string }[] = [];
+    const add = (name: string, target: string, ok: boolean, level: 'error' | 'warn' | 'info', detail: string) => checks.push({ name, target, ok, level, detail: String(detail).slice(0, 400) });
+    const agents = await (this.prisma as any).replicationAgent.findMany().catch(() => []);
+    const now = Date.now();
+    const agentOnline = (host: string) => { const a = agents.find((x: any) => x.host === host); return a && a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 180_000 ? a : null; };
+
+    const srcRole = set.state === 'failed-over' ? 'secondary' : set.state === 'tertiary-active' ? 'tertiary' : 'primary';
+    const srcHost = set.state === 'failed-over' ? set.secondaryHost : set.state === 'tertiary-active' ? set.tertiaryHost : set.primaryHost;
+    const tgtHost = srcRole === 'primary' ? set.secondaryHost : set.primaryHost;
+    const endpoints: { role: 'primary' | 'secondary' | 'tertiary'; host: string; isSource: boolean }[] = [
+      { role: 'primary', host: set.primaryHost, isSource: srcRole === 'primary' },
+      { role: 'secondary', host: set.secondaryHost, isSource: srcRole === 'secondary' },
+    ];
+    if (set.tertiaryHost) endpoints.push({ role: 'tertiary', host: set.tertiaryHost, isSource: srcRole === 'tertiary' });
+
+    // 0) config sanity
+    if (!srcHost || !tgtHost) add('Endpoints configured', set.name, false, 'error', 'Source and/or target host is blank — set them in Edit.');
+    if (srcHost && srcHost === tgtHost) add('Distinct endpoints', set.name, false, 'error', 'Source and target resolve to the same host.');
+    const crossPriv = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/;
+    if (set.driver === 'orchestrated' && (crossPriv.test(srcHost) || crossPriv.test(tgtHost))) add('Address routable from MCMF', set.name, false, 'warn', `A private IP (${crossPriv.test(srcHost) ? srcHost : tgtHost}) is usually unreachable from MCMF or across clouds. Pick a Public address in Edit, or use the Installed agent driver.`);
+
+    for (const ep of endpoints) {
+      if (!ep.host) continue;
+      const os = await this.endpointOs(set, ep.role);
+      // credential presence
+      let cred: any = null;
+      try { cred = await this.sshCred(ep.host); } catch (e) { add('SSH credential', ep.host, false, 'error', String((e as Error)?.message ?? e)); }
+      if (cred) add('SSH credential in Vault', ep.host, true, 'info', `user ${cred.username}, port ${cred.port} (${os})`);
+      else if (cred === null) add('SSH credential in Vault', ep.host, false, set.driver === 'agent' && !ep.isSource ? 'error' : ep.isSource && set.driver === 'agent' ? 'info' : 'error', set.driver === 'agent' && ep.isSource ? 'Source runs the agent — no inbound cred needed here.' : `No credential for ${ep.host} — add it in Credential Vault.`);
+
+      // agent status (agent driver)
+      if (set.driver === 'agent') {
+        const a = agentOnline(ep.host);
+        if (ep.isSource) add('Agent online (source)', ep.host, !!a, a ? 'info' : 'error', a ? `${a.os || os} agent v${a.version}, last seen ${Math.round((now - new Date(a.lastSeenAt).getTime()) / 1000)}s ago` : 'No agent has checked in from this host in the last 3 min — install/start the agent here.');
+      }
+
+      // live SSH probe from MCMF (only meaningful for Linux + when we have creds; best-effort)
+      if (cred && os === 'linux') {
+        try {
+          const r = await sshRun(ep.host, cred.port, cred.username, cred.password, 'echo MCMF_OK; command -v rsync >/dev/null 2>&1 && echo HAS_RSYNC; command -v pg_dump >/dev/null 2>&1 && echo HAS_PGDUMP; command -v docker >/dev/null 2>&1 && echo HAS_DOCKER', 20_000);
+          const out = r.stdout || '';
+          const reachable = /MCMF_OK/.test(out);
+          add('MCMF → host SSH', ep.host, reachable, reachable ? 'info' : set.driver === 'agent' ? 'warn' : 'error', reachable ? 'reachable' : 'MCMF cannot open SSH to this host (expected for private/NAT hosts under the agent driver).');
+          if (reachable && ep.isSource) {
+            if (set.dataType === 'files') add('rsync on source', ep.host, /HAS_RSYNC/.test(out), /HAS_RSYNC/.test(out) ? 'info' : 'error', /HAS_RSYNC/.test(out) ? 'present' : 'rsync not found — install it on the source.');
+            if (set.dataType === 'database') add('DB client on source', ep.host, /HAS_PGDUMP/.test(out), /HAS_PGDUMP/.test(out) ? 'info' : 'warn', /HAS_PGDUMP/.test(out) ? 'pg_dump present' : 'pg_dump/mysqldump not detected on the source.');
+            if (set.dataType === 'docker') add('docker on source', ep.host, /HAS_DOCKER/.test(out), /HAS_DOCKER/.test(out) ? 'info' : 'error', /HAS_DOCKER/.test(out) ? 'present' : 'docker not found on the source.');
+          }
+        } catch (e) {
+          add('MCMF → host SSH', ep.host, false, set.driver === 'agent' ? 'warn' : 'error', String((e as Error)?.message ?? e).slice(0, 200));
+        }
+      } else if (cred && os === 'windows') {
+        add('MCMF → host SSH', ep.host, false, 'info', 'Windows host — MCMF does not probe it directly; the installed agent runs the job locally.');
+      }
+    }
+
+    const errors = checks.filter((c) => !c.ok && c.level === 'error').length;
+    const warns = checks.filter((c) => !c.ok && c.level === 'warn').length;
+    const summary = errors ? `${errors} blocking issue${errors > 1 ? 's' : ''}${warns ? `, ${warns} warning${warns > 1 ? 's' : ''}` : ''}` : warns ? `No blocking issues, ${warns} warning${warns > 1 ? 's' : ''}` : 'All checks passed';
+    return { ok: errors === 0, summary, driver: set.driver, checks };
   }
 
   private drbdRes(set: any) { return 'mcmf' + String(set.id).replace(/[^a-zA-Z0-9]/g, '').slice(-8); }
@@ -399,9 +533,17 @@ export class ReplicationService implements OnModuleInit {
     const tu = tgtCred.username;
     const SSHO = `-i "${KEY_PATH_WIN}" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15`;
     // Everything is PIPED through ssh (tar/dump | ssh ...) — no local staging and no scp, so Windows
-    // never has to hand scp a "C:\..." path (which scp misreads as host:path). Target side is Linux.
+    // never has to hand scp a "C:\..." path (which scp misreads as host:path).
     const sshT = (remote: string) => `ssh ${SSHO} ${tu}@${tgtHost} "${remote}"`;
     const onTarget = (script: string) => sshT(`echo ${Buffer.from(script).toString('base64')} | base64 -d | bash`);
+
+    // Is the TARGET a Windows host? (Windows->Windows is common; a Linux-only target script would fail.)
+    // The operator's explicit OS choice on the set wins; else infer from the resource/provider.
+    const tgtRole = direction === 'p2s' ? 'secondary' : 'tertiary';
+    const tgtWin = /^win/i.test(await this.endpointOs(set, tgtRole as any));
+    // Run a script on a WINDOWS target via PowerShell -EncodedCommand (base64 UTF-16LE) — dodges all
+    // cmd/PowerShell nested-quoting issues, mirroring the base64|bash trick used for Linux targets.
+    const onTargetWin = (ps: string) => sshT(`powershell -NoProfile -EncodedCommand ${Buffer.from(ps, 'utf16le').toString('base64')}`);
 
     if (set.dataType === 'database') {
       if (!set.dbName) throw new Error('No database name set on this replication set.');
@@ -432,6 +574,13 @@ export class ReplicationService implements OnModuleInit {
     // files: tar the source dir (bsdtar ships with Win10+/Server2019+) and pipe it over ssh into the
     // target (additive — no --delete on the tar path).
     const src = set.sourcePath || 'C:\\data';
+    if (tgtWin) {
+      // Windows -> Windows: extract on the target via PowerShell (tar ships with Win10+/Server2019+).
+      const tgtW = (set.targetPath || set.sourcePath || 'C:\\mcmf-repl').replace(/'/g, "''");
+      const ps = `$ErrorActionPreference='Stop'; if(!(Test-Path '${tgtW}')){New-Item -ItemType Directory -Force -Path '${tgtW}' | Out-Null}; tar -xzf - -C '${tgtW}'; Write-Output 'MCMF_JOB_OK'`;
+      return { command: `tar czf - -C "${src}" . | ${onTargetWin(ps)}`, timeoutMs: 300_000 };
+    }
+    // Windows -> Linux: extract in bash on the target.
     const tgt = (set.targetPath || set.sourcePath || '/var/www').replace(/'/g, "'\\''");
     const command = `tar czf - -C "${src}" . | ${sshT(`mkdir -p '${tgt}' && cd '${tgt}' && tar xzf -`)} && echo MCMF_JOB_OK`;
     return { command, timeoutMs: 300_000 };

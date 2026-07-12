@@ -271,8 +271,25 @@ export class AwsConnector implements CloudConnector {
     }));
     const connId = conn.VpnConnection?.VpnConnectionId ?? '';
     if (connId && opts.peerCidr) await ec2.send(new CreateVpnConnectionRouteCommand({ VpnConnectionId: connId, DestinationCidrBlock: opts.peerCidr })).catch(() => undefined);
-    const outsideIps = (conn.VpnConnection?.VgwTelemetry ?? []).map((t) => t.OutsideIpAddress ?? '').filter(Boolean);
+    const outsideIps = this.connOutsideIps(conn.VpnConnection);
     return { connId, outsideIps };
+  }
+
+  private connOutsideIps(v: any): string[] {
+    const tel = (v?.VgwTelemetry ?? []).map((t: any) => t.OutsideIpAddress ?? '').filter(Boolean);
+    const opt = (v?.Options?.TunnelOptions ?? []).map((t: any) => t.OutsideIpAddress ?? '').filter(Boolean);
+    return [...new Set<string>([...tel, ...opt])];
+  }
+
+  /**
+   * Re-read a VPN connection's tunnel OUTSIDE IPs. AWS assigns these a few minutes AFTER CreateVpnConnection,
+   * so fabricConnection() often gets an empty list at creation time — the fabric polls this across ticks.
+   */
+  async fabricConnectionOutsideIps(credentials: ProviderCredentials, opts: { connId: string; region?: string }): Promise<string[]> {
+    this.creds = credentials;
+    const ec2 = new EC2Client(this.clientConfig(opts.region));
+    const d = await ec2.send(new DescribeVpnConnectionsCommand({ VpnConnectionIds: [opts.connId] }));
+    return this.connOutsideIps(d.VpnConnections?.[0]);
   }
 
   /** Tear down a fabric's AWS VPN resources (connection, customer gateway, VGW). Best-effort per step. */
@@ -535,18 +552,26 @@ export class AwsConnector implements CloudConnector {
       const ports = (Array.isArray(spec.consolePorts) ? spec.consolePorts : String(spec.consolePorts ?? '').split(','))
         .map((s) => String(s).trim()).filter((s) => /^\d{1,5}$/.test(s));
       const sources = String(spec.sourceCidrs ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-      let sgId: string | undefined;
+      // Bring-your-own security group: if the caller passes existing SG id(s), attach them instead of
+      // creating one — lets provisioning work when the IAM user lacks ec2:CreateSecurityGroup but already
+      // has a group that opens the needed ports (e.g. SSH).
+      const byoSgs = (Array.isArray((spec as any).securityGroupIds) ? (spec as any).securityGroupIds : String((spec as any).securityGroupIds ?? (spec as any).securityGroupId ?? '').split(','))
+        .map((s: any) => String(s).trim()).filter((s: string) => /^sg-[0-9a-f]+$/i.test(s));
+      let sgIds: string[] = [];
       let consoleHint: string | undefined;
       try {
-        if (ports.length) {
+        if (byoSgs.length) {
+          sgIds = byoSgs;
+          consoleHint = `using existing security group(s) ${byoSgs.join(', ')}`;
+        } else if (ports.length) {
           // Resolve the VPC (from the chosen subnet, else the region's default VPC).
           let vpcId: string | undefined;
           if (spec.subnetId) { const sn = await ec2.send(new DescribeSubnetsCommand({ SubnetIds: [String(spec.subnetId)] })); vpcId = sn.Subnets?.[0]?.VpcId; }
           if (!vpcId) { const v = await ec2.send(new DescribeVpcsCommand({ Filters: [{ Name: 'isDefault', Values: ['true'] }] })); vpcId = v.Vpcs?.[0]?.VpcId; }
           const sg = await ec2.send(new CreateSecurityGroupCommand({ GroupName: `mcmf-${spec.name}-console-${Date.now().toString().slice(-5)}`, Description: 'MCMF console access', VpcId: vpcId }));
-          sgId = sg.GroupId;
+          sgIds = sg.GroupId ? [sg.GroupId] : [];
           await ec2.send(new AuthorizeSecurityGroupIngressCommand({
-            GroupId: sgId,
+            GroupId: sgIds[0],
             IpPermissions: ports.map((p) => ({ IpProtocol: 'tcp', FromPort: Number(p), ToPort: Number(p), IpRanges: (sources.length ? sources : ['0.0.0.0/0']).map((c) => ({ CidrIp: c, Description: 'MCMF console' })) })),
           }));
           consoleHint = `opened TCP ${ports.join(', ')} from ${sources.length ? sources.join(', ') : 'any'}`;
@@ -559,8 +584,8 @@ export class AwsConnector implements CloudConnector {
           UserData: userData,
           ...(spec.keyPair ? { KeyName: String(spec.keyPair) } : {}),
           // With an SG, use a public-IP network interface (carries the SG + subnet); else top-level subnet.
-          ...(sgId
-            ? { NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: true, Groups: [sgId], DeleteOnTermination: true, ...(spec.subnetId ? { SubnetId: String(spec.subnetId) } : {}) }] }
+          ...(sgIds.length
+            ? { NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: true, Groups: sgIds, DeleteOnTermination: true, ...(spec.subnetId ? { SubnetId: String(spec.subnetId) } : {}) }] }
             : (spec.subnetId ? { SubnetId: String(spec.subnetId) } : {})),
           ...(spec.volumeSizeGb ? { BlockDeviceMappings: [{ DeviceName: '/dev/xvda', Ebs: { VolumeSize: Number(spec.volumeSizeGb) } }] } : {}),
           TagSpecifications: [{ ResourceType: 'instance', Tags: [{ Key: 'Name', Value: spec.name }, { Key: 'createdBy', Value: 'MCMF' }] }],
