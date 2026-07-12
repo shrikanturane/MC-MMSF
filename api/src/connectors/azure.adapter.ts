@@ -244,15 +244,26 @@ export class AzureConnector implements CloudConnector {
         throw azureProvisionError('Resource group lookup', rgGet.status, await rgGet.text());
       }
 
-      // 2. Create the VNet with a "default" subnet (explicit, else carved /24).
+      // 2. Create/ensure the VNet with a "default" subnet (explicit, else carved /24). IDEMPOTENT: if the
+      //    VNet already exists (e.g. left behind by a fabric tear-down), PRESERVE its existing subnets —
+      //    replacing the list would try to DELETE a GatewaySubnet still held by a detaching VPN gateway
+      //    ("InUseSubnetCannotBeDeleted"). We only ensure a 'default' subnet is present.
       const subnetPrefix = (spec.subnetCidr || '').trim() || defaultSubnet(cidr);
       const vnetUrl = `${base}/resourceGroups/${encodeURIComponent(rg)}/providers/Microsoft.Network/virtualNetworks/${encodeURIComponent(name)}?api-version=2023-05-01`;
+      const vnetGet = await fetch(vnetUrl, { headers: { authorization: `Bearer ${token}` } });
+      let subnets: any[] = [{ name: 'default', properties: { addressPrefix: subnetPrefix } }];
+      let addressPrefixes = [cidr];
+      if (vnetGet.ok) {
+        const ex: any = await vnetGet.json();
+        const exSubnets = (ex?.properties?.subnets ?? []).map((s: any) => ({ name: s.name, properties: { addressPrefix: s.properties?.addressPrefix } }));
+        subnets = exSubnets.length ? exSubnets : subnets;
+        if (!subnets.some((s) => s.name === 'default')) subnets.push({ name: 'default', properties: { addressPrefix: subnetPrefix } });
+        const exPrefixes = ex?.properties?.addressSpace?.addressPrefixes ?? [];
+        if (exPrefixes.length) addressPrefixes = exPrefixes.includes(cidr) ? exPrefixes : [...exPrefixes, cidr];
+      }
       const vnetBody = {
         location: region,
-        properties: {
-          addressSpace: { addressPrefixes: [cidr] },
-          subnets: [{ name: 'default', properties: { addressPrefix: subnetPrefix } }],
-        },
+        properties: { addressSpace: { addressPrefixes }, subnets },
         tags: { createdBy: 'MCMF' },
       };
       const res = await fetch(vnetUrl, auth('PUT', vnetBody));
