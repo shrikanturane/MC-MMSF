@@ -65,6 +65,31 @@ export class VpnService implements OnModuleInit {
     }));
   }
 
+  /**
+   * Discover EXISTING cross-cloud connectivity across all CONNECTED clouds — site-to-site VPN connections,
+   * VPN tunnels, ExpressRoute / Interconnect cross-connects — with live status. Read-only inventory so an
+   * operator deploying MCMF into a running environment immediately sees what's already wired up.
+   */
+  async discovered() {
+    const conns = await this.prisma.cloudConnection.findMany({ where: { status: 'connected' } }).catch(() => []);
+    const results = await Promise.all(conns.map(async (cc: any) => {
+      const provider = String(cc.provider).toLowerCase();
+      if (!['aws', 'azure', 'gcp'].includes(provider)) return [];
+      let creds: any; try { creds = decryptJson(cc.credentials); } catch { return []; }
+      const conn = getConnector(provider) as any;
+      if (typeof conn.discoverVpn !== 'function') return [];
+      try {
+        const items = await conn.discoverVpn(creds);
+        return (items || []).map((it: any) => ({ ...it, account: cc.accountRef || cc.name || provider }));
+      } catch (e) {
+        this.log.warn(`discoverVpn(${provider}): ${String((e as Error)?.message ?? e)}`);
+        return [];
+      }
+    }));
+    const items = results.flat();
+    return { items, byProvider: { aws: items.filter((i) => i.provider === 'aws').length, azure: items.filter((i) => i.provider === 'azure').length, gcp: items.filter((i) => i.provider === 'gcp').length }, up: items.filter((i) => i.status === 'up').length, total: items.length };
+  }
+
   /** Running VMs that have an SSH credential in the Vault — the endpoints MCMF can genuinely reach. */
   async eligibleHosts() {
     const vms = await this.prisma.resource.findMany({ where: { type: 'compute' }, select: { id: true, name: true, provider: true, status: true, properties: true } });

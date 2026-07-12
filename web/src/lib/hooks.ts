@@ -1007,6 +1007,9 @@ export interface VpnRequirements {
 export const useVpnLinks = () => useQuery({ queryKey: ['vpn'], queryFn: () => apiGet<VpnLink[]>('/vpn'), refetchInterval: 10000 });
 export const useVpnGatewayTypes = () => useQuery({ queryKey: ['vpn-gw-types'], queryFn: () => apiGet<VpnGatewayType[]>('/vpn/gateway-types'), staleTime: 300000 });
 export const useVpnEligibleHosts = () => useQuery({ queryKey: ['vpn-eligible'], queryFn: () => apiGet<VpnEligibleHost[]>('/vpn/eligible-hosts'), staleTime: 30000 });
+export interface DiscoveredVpn { provider: string; kind: string; id: string; name: string; region?: string; account?: string; status: string; managed?: boolean; localAddr?: string; remoteAddr?: string; remoteSubnets?: string; detail?: string }
+export interface DiscoveredVpnResult { items: DiscoveredVpn[]; byProvider: { aws: number; azure: number; gcp: number }; up: number; total: number }
+export const useDiscoveredVpn = () => useQuery({ queryKey: ['vpn-discovered'], queryFn: () => apiGet<DiscoveredVpnResult>('/vpn/discovered'), refetchInterval: 30000 });
 export const useVpnRequirements = () => useMutation({ mutationFn: (b: Record<string, unknown>) => apiPost<VpnRequirements>('/vpn/requirements', b) });
 const useVpnMutation = <T,>(fn: (v: T) => Promise<unknown>) => {
   const qc = useQueryClient();

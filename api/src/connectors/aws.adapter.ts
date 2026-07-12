@@ -5,6 +5,7 @@ import {
   DescribeSecurityGroupsCommand,
   DescribeVpcsCommand,
   DescribeVpnConnectionsCommand,
+  DescribeCustomerGatewaysCommand,
   CreateVpnGatewayCommand,
   AttachVpnGatewayCommand,
   CreateCustomerGatewayCommand,
@@ -242,6 +243,42 @@ export class AwsConnector implements CloudConnector {
     const tels = c?.VgwTelemetry ?? [];
     const tunnels = tels.map((t) => ({ ip: t.OutsideIpAddress ?? '', status: String(t.Status ?? 'UNKNOWN'), msg: t.StatusMessage ?? '' }));
     return { up: tunnels.some((t) => t.status === 'UP'), state: String(c?.State ?? 'unknown'), tunnels };
+  }
+
+  /**
+   * Discover EXISTING site-to-site VPN connections across all regions (pre-existing or MCMF-created), with
+   * live tunnel status — so an operator deploying MCMF into a running account sees their cross-cloud links.
+   */
+  async discoverVpn(credentials: ProviderCredentials): Promise<any[]> {
+    this.creds = credentials;
+    const regions = await this.listRegions().catch(() => ['us-east-1']);
+    const out: any[] = [];
+    await Promise.all(regions.map(async (region) => {
+      try {
+        const ec2 = new EC2Client(this.clientConfig(region));
+        const [vc, cg] = await Promise.all([
+          ec2.send(new DescribeVpnConnectionsCommand({})),
+          ec2.send(new DescribeCustomerGatewaysCommand({})).catch(() => ({ CustomerGateways: [] as any[] })),
+        ]);
+        const cgIp = new Map((cg.CustomerGateways ?? []).map((g: any) => [g.CustomerGatewayId, g.IpAddress]));
+        for (const c of vc.VpnConnections ?? []) {
+          if (c.State === 'deleted') continue;
+          const tels = c.VgwTelemetry ?? [];
+          const up = tels.filter((t) => t.Status === 'UP').length;
+          out.push({
+            provider: 'aws', kind: 'vpn', id: c.VpnConnectionId, region,
+            name: c.Tags?.find((t) => t.Key === 'Name')?.Value || c.VpnConnectionId,
+            managed: (c.Tags ?? []).some((t) => t.Key === 'createdBy' && t.Value === 'MCMF'),
+            status: up > 0 ? 'up' : c.State === 'available' ? 'down' : String(c.State),
+            localAddr: tels.map((t) => t.OutsideIpAddress).filter(Boolean).join(', '),
+            remoteAddr: cgIp.get(c.CustomerGatewayId) || '',
+            remoteSubnets: (c.Routes ?? []).map((r) => r.DestinationCidrBlock).filter(Boolean).join(', '),
+            detail: `Site-to-Site VPN · ${up}/${tels.length} tunnels up${c.TransitGatewayId ? ' · TGW' : c.VpnGatewayId ? ' · VGW' : ''}`,
+          });
+        }
+      } catch { /* region not enabled / no perms */ }
+    }));
+    return out;
   }
 
   /**

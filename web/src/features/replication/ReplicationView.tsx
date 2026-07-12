@@ -5,7 +5,7 @@ import { Card, Modal } from '@/components/ui';
 import { useResources } from '@/lib/hooks';
 import {
   useReplicationSets, useCreateReplication, useDeleteReplication, useRunReplication, usePromoteReplication, useUpdateReplication, useEnrollAgent, useStopReplication, useTestReplication,
-  useVpnLinks, useCreateVpn, useDeleteVpn, useVpnUp, useVpnDown, useVpnLinkStatus, useVpnGatewayTypes, useVpnRequirements, useVpnEligibleHosts, useVpnMonitor,
+  useVpnLinks, useCreateVpn, useDeleteVpn, useVpnUp, useVpnDown, useVpnLinkStatus, useVpnGatewayTypes, useVpnRequirements, useVpnEligibleHosts, useVpnMonitor, useDiscoveredVpn, type DiscoveredVpn,
   useFabrics, useCreateFabric, useUpdateFabric, useArmFabric, useRetryFabric, useDeprovisionFabric, useDeleteFabric,
   type ReplicationSet, type ReplicationAgentInfo, type AgentEnroll, type ReplicationTest, type VpnLink, type VpnRequirements, type VpnEligibleHost, type NetworkFabric,
 } from '@/lib/hooks';
@@ -485,6 +485,48 @@ function NewFabricModal({ initial, onClose, onSave, busy }: { initial?: NetworkF
 
 const VPN_COLOR: Record<string, string> = { up: '#22c55e', down: '#64748b', error: '#ef4444', idle: '#64748b' };
 
+const KIND_LABEL: Record<string, string> = { vpn: 'Site-to-site VPN', expressroute: 'ExpressRoute', interconnect: 'Interconnect', directconnect: 'Direct Connect' };
+// Read-only inventory of EXISTING cross-cloud connectivity found in the connected clouds (pre-existing or
+// set up outside MCMF) — so an operator sees what's already wired up + its live status the moment they connect a cloud.
+function DiscoveredVpnSection() {
+  const q = useDiscoveredVpn();
+  const res = q.data;
+  if (!res || res.total === 0) {
+    return (
+      <div className="mb-3 rounded-lg border border-border bg-bg/40 px-3 py-2 text-2xs text-muted">
+        🔎 <b className="text-white">Discovered</b> — MCMF scans every connected cloud for existing site-to-site VPNs, tunnels and cross-connects. {q.isLoading ? 'Scanning…' : 'None found in the connected clouds (or the connection lacks read permission).'}
+      </div>
+    );
+  }
+  const items = [...res.items].sort((a: DiscoveredVpn, b: DiscoveredVpn) => (a.provider + a.name).localeCompare(b.provider + b.name));
+  return (
+    <div className="mb-3">
+      <div className="mb-1.5 flex items-center gap-2 text-2xs text-muted">
+        <span>🔎 <b className="text-white">Discovered cross-cloud connectivity</b> — existing links found in your clouds (read-only)</span>
+        <span className="rounded bg-bg px-1.5 py-0.5" style={{ color: '#22c55e' }}>{res.up} up</span>
+        <span className="rounded bg-bg px-1.5 py-0.5 text-muted-light">{res.total} total</span>
+        <button onClick={() => q.refetch()} disabled={q.isFetching} className="ml-auto rounded border border-border bg-card px-2 py-0.5 text-muted-light hover:text-white disabled:opacity-50">{q.isFetching ? '◌' : '↻'} Rescan</button>
+      </div>
+      <div className="grid gap-2 lg:grid-cols-2">
+        {items.map((it) => (
+          <div key={it.provider + it.id} className="flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-card/40 px-2.5 py-1.5 text-2xs">
+            <span className="h-2 w-2 rounded-full" style={{ background: VPN_COLOR[it.status] ?? '#64748b' }} />
+            <ProvChip p={it.provider} />
+            <span className="font-medium text-white">{it.name}</span>
+            <span className="rounded bg-bg px-1 py-0.5 text-muted">{KIND_LABEL[it.kind] ?? it.kind}</span>
+            {it.managed && <span className="rounded px-1 py-0.5 text-brand" style={{ background: '#3b82f622' }}>MCMF</span>}
+            {it.region && <span className="text-muted">{it.region}</span>}
+            <span className="ml-auto rounded px-1.5 py-0.5 font-medium" style={{ background: (VPN_COLOR[it.status] ?? '#64748b') + '22', color: VPN_COLOR[it.status] ?? '#64748b' }}>{it.status === 'up' ? '● connected' : it.status}</span>
+            {(it.remoteAddr || it.remoteSubnets || it.detail) && (
+              <div className="w-full text-muted">{it.remoteAddr ? <>peer <span className="font-mono text-muted-light">{it.remoteAddr}</span> · </> : null}{it.remoteSubnets ? <>routes <span className="font-mono text-muted-light">{it.remoteSubnets}</span> · </> : null}{it.detail}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function VpnPanel() {
   const links = useVpnLinks();
   const up = useVpnUp(); const down = useVpnDown(); const stat = useVpnLinkStatus(); const del = useDeleteVpn(); const mon = useVpnMonitor();
@@ -498,6 +540,8 @@ function VpnPanel() {
         <button onClick={() => setShowNew(true)} className="ml-auto rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-white hover:border-brand">+ New VPN link</button>
       </div>
       <p className="mb-3 text-2xs text-muted">A private, encrypted IPsec tunnel between two clouds/sites. Two ways: <b className="text-white">⚙ auto-config</b> (both ends are managed Linux VMs — MCMF installs strongSwan and builds the tunnel) or <b className="text-white">👁 monitor-only</b> (gateway↔gateway — AWS/Azure/GCP/on-prem VPN gateways you set up yourself; MCMF just watches the site-to-site status + which ports are open, via the cloud API or an active probe). Point a replication set at the peer&apos;s private subnet to use it.</p>
+      <DiscoveredVpnSection />
+
       {!list.length ? (
         <div className="rounded-xl border border-dashed border-border py-6 text-center text-2xs text-muted">No VPN links yet. Create one to give replication a private encrypted path.</div>
       ) : (

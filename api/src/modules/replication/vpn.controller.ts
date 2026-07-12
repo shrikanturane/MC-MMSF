@@ -21,6 +21,11 @@ export class VpnController {
     return this.service.eligibleHosts();
   }
 
+  @Get('discovered')
+  discovered() {
+    return this.service.discovered();
+  }
+
   @Post('requirements')
   requirements(@Body() body: any) {
     return this.service.requirements(body ?? {});

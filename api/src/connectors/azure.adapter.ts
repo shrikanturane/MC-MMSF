@@ -417,6 +417,45 @@ export class AzureConnector implements CloudConnector {
   }
 
   /**
+   * Discover EXISTING cross-cloud/site-to-site connectivity in the subscription: VPN gateway connections
+   * (IPsec / VNet-to-VNet) with live connectionStatus, plus ExpressRoute circuits (cross-connect).
+   */
+  async discoverVpn(credentials: ProviderCredentials): Promise<any[]> {
+    const { subscriptionId } = this.require(credentials);
+    const token = await getAzureToken(credentials);
+    const h = { authorization: `Bearer ${token}` } as any;
+    const base = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.Network`;
+    const av = 'api-version=2023-09-01';
+    const out: any[] = [];
+    try {
+      const r = await fetch(`${base}/connections?${av}`, { headers: h });
+      if (r.ok) for (const c of ((await r.json()) as any)?.value ?? []) {
+        const pr = c.properties || {};
+        out.push({
+          provider: 'azure', kind: pr.connectionType === 'ExpressRoute' ? 'expressroute' : 'vpn', id: `${(c.id || '').split('/resourceGroups/')[1]?.split('/providers')[0] || ''}/${c.name}`, name: c.name, region: c.location,
+          managed: c.tags?.createdBy === 'MCMF',
+          status: pr.connectionStatus === 'Connected' ? 'up' : pr.connectionStatus ? 'down' : 'unknown',
+          localAddr: '', remoteAddr: '', remoteSubnets: '',
+          detail: `${pr.connectionType || 'connection'}${pr.connectionStatus ? ' · ' + pr.connectionStatus : ''}`,
+        });
+      }
+    } catch { /* no perms */ }
+    try {
+      const r = await fetch(`${base}/expressRouteCircuits?${av}`, { headers: h });
+      if (r.ok) for (const c of ((await r.json()) as any)?.value ?? []) {
+        const pr = c.properties || {};
+        out.push({
+          provider: 'azure', kind: 'expressroute', id: c.name, name: c.name, region: c.location, managed: false,
+          status: pr.serviceProviderProvisioningState === 'Provisioned' ? 'up' : 'down',
+          localAddr: '', remoteAddr: pr.serviceProviderProperties?.peeringLocation || '', remoteSubnets: '',
+          detail: `ExpressRoute · ${pr.serviceProviderProperties?.serviceProviderName || ''} ${pr.serviceProviderProvisioningState || ''}`.trim(),
+        });
+      }
+    } catch { /* no perms */ }
+    return out;
+  }
+
+  /**
    * Cross-cloud fabric (Azure VPN Gateway). Creates a static Public IP (address known immediately), a
    * GatewaySubnet, and starts a route-based VPN gateway. NOTE: the gateway itself takes ~30-45 minutes to
    * provision; the orchestrator polls provisioningState before creating the connection. EXPERIMENTAL:

@@ -206,6 +206,43 @@ export class GcpConnector implements CloudConnector {
   }
 
   /**
+   * Discover EXISTING cross-cloud connectivity in the project: Cloud VPN tunnels (aggregated across all
+   * regions) with live status, plus Interconnect attachments (cross-connect).
+   */
+  async discoverVpn(credentials: ProviderCredentials): Promise<any[]> {
+    const { token, project } = await getGcpToken(credentials);
+    const h = { authorization: `Bearer ${token}` } as any;
+    const out: any[] = [];
+    try {
+      const r = await fetch(`https://compute.googleapis.com/compute/v1/projects/${project}/aggregated/vpnTunnels`, { headers: h });
+      if (r.ok) for (const [, scope] of Object.entries(((await r.json()) as any)?.items ?? {})) {
+        for (const t of (scope as any)?.vpnTunnels ?? []) {
+          out.push({
+            provider: 'gcp', kind: 'vpn', id: `${String(t.region || '').split('/').pop()}/${t.name}`, name: t.name, region: String(t.region || '').split('/').pop(),
+            managed: /mcmf/i.test(String(t.name || '')),
+            status: t.status === 'ESTABLISHED' ? 'up' : 'down',
+            localAddr: t.vpnGatewayInterface != null ? '' : '', remoteAddr: t.peerIp || t.peerExternalGateway || t.peerGcpGateway || '', remoteSubnets: (t.localTrafficSelector || []).join(', '),
+            detail: `Cloud VPN · ${t.status || ''}${t.detailedStatus ? ' · ' + t.detailedStatus : ''}`.trim(),
+          });
+        }
+      }
+    } catch { /* no perms */ }
+    try {
+      const r = await fetch(`https://compute.googleapis.com/compute/v1/projects/${project}/aggregated/interconnectAttachments`, { headers: h });
+      if (r.ok) for (const [, scope] of Object.entries(((await r.json()) as any)?.items ?? {})) {
+        for (const a of (scope as any)?.interconnectAttachments ?? []) {
+          out.push({
+            provider: 'gcp', kind: 'interconnect', id: `${String(a.region || '').split('/').pop()}/${a.name}`, name: a.name, region: String(a.region || '').split('/').pop(), managed: false,
+            status: a.state === 'ACTIVE' ? 'up' : 'down', localAddr: a.cloudRouterIpAddress || '', remoteAddr: a.customerRouterIpAddress || '', remoteSubnets: '',
+            detail: `Interconnect · ${a.type || ''} ${a.state || ''}`.trim(),
+          });
+        }
+      }
+    } catch { /* no perms */ }
+    return out;
+  }
+
+  /**
    * Cross-cloud fabric (GCP Classic Cloud VPN). Reserves a regional external IP, creates a target VPN
    * gateway on the network, and adds ESP/UDP-500/UDP-4500 forwarding rules. Returns the assigned public IP.
    * EXPERIMENTAL: unverified against a live billing-enabled project; calls are best-effort and idempotent-ish.
