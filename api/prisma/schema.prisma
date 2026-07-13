@@ -987,6 +987,30 @@ model ReplicationSet {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   runs          ReplicationRun[]
+  failoverTrials FailoverTrial[]
+}
+
+// A controlled failover exercise: one run of promote() (real or simulated drill) with precise
+// per-stage timestamps and post-promote verification, so DR failover can be validated with
+// auditable RTO/RPO evidence. rpoSeconds = data-loss window (now - lastOkAt at trigger time);
+// rtoSeconds = recovery time (verifiedAt - triggeredAt). Never repoints DNS (operator's job).
+model FailoverTrial {
+  id                 String         @id @default(cuid())
+  replicationSetId   String
+  set                ReplicationSet @relation(fields: [replicationSetId], references: [id], onDelete: Cascade)
+  triggeredBy        String         @default("") // user id/email that started the trial ("" = system)
+  mode               String         @default("real") // real | simulated (safe drill)
+  to                 String         @default("secondary") // promotion target: primary | secondary | tertiary
+  triggeredAt        DateTime       @default(now())
+  promotedAt         DateTime?      // when the new primary was made active (post promote command)
+  verifiedAt         DateTime?      // when the new primary was confirmed live (post verification)
+  rpoSeconds         Int?           // derived from the set's lastOkAt at trigger time (null = unknown)
+  rtoSeconds         Int?           // verifiedAt - triggeredAt (null = never verified)
+  outcome            String         @default("failed") // success | partial | failed
+  verificationDetail String         @default("") // human-readable verification summary
+  drbdOutput         String         @default("") // raw drbdadm status captured during verification
+
+  @@index([replicationSetId, triggeredAt])
 }
 
 model ReplicationRun {

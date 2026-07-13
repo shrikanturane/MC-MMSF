@@ -1,8 +1,10 @@
 import { Injectable, Logger, OnModuleInit, BadRequestException } from '@nestjs/common';
 import { randomBytes } from 'crypto';
+import { connect as netConnect } from 'net';
 import { PrismaService } from '../../prisma/prisma.service';
 import { sshRun } from '../database/ssh-deploy';
 import { decryptJson, encryptJson } from '../../connectors/crypto';
+import { computeRpoSeconds, computeRtoSeconds, deriveOutcome, parseDrbdRole } from './failover-metrics';
 
 type Dir = 'p2s' | 'p2t' | 's2t';
 
@@ -870,28 +872,169 @@ export class ReplicationService implements OnModuleInit {
     return { ok: true };
   }
 
-  /** Failover: mark which side is live. DNS repointing is the operator's job (external). */
-  async promote(id: string, to: 'primary' | 'secondary' | 'tertiary') {
+  /**
+   * Failover: promote a side to ACTIVE, instrumented as a controlled trial that records auditable
+   * RTO/RPO evidence. Each stage is timestamped (trigger → old-primary demote → new-primary promote
+   * → verification), the new primary is *verified live* (re-parsed drbdadm status + a host health
+   * probe — never trusting the SSH exit code alone), and a FailoverTrial row is persisted with the
+   * computed rpoSeconds/rtoSeconds/outcome. Actual failover behaviour is unchanged.
+   * DNS repointing is the operator's job (external) — MCMF does not manage DNS.
+   */
+  async promote(
+    id: string,
+    to: 'primary' | 'secondary' | 'tertiary',
+    triggeredBy = '',
+    mode: 'real' | 'simulated' = 'real',
+  ) {
     const set = await this.prisma.replicationSet.findUnique({ where: { id } });
     if (!set) throw new BadRequestException('replication set not found');
     if (to === 'tertiary' && !set.tertiaryHost) throw new BadRequestException('No tertiary VM configured on this set.');
+
+    // Stage 0 — trigger. Capture RPO baseline (last known-good replication) BEFORE any mutation.
+    const triggeredAt = new Date();
+    const rpoSeconds = computeRpoSeconds(set.lastOkAt, triggeredAt);
+
     const state = to === 'primary' ? 'primary-active' : to === 'tertiary' ? 'tertiary-active' : 'failed-over';
     const active = to === 'primary' ? set.primaryName : to === 'tertiary' ? set.tertiaryName : set.secondaryName;
     const activeHost = to === 'primary' ? set.primaryHost : to === 'tertiary' ? set.tertiaryHost : set.secondaryHost;
+    const isBlock = set.dataType === 'block' && to !== 'tertiary';
+
     let drbd = '';
-    if (set.dataType === 'block' && to !== 'tertiary') {
+    let promotedAt: Date | null = null;
+    let promoted = false;
+    if (isBlock) {
       // DRBD failover: make the new active node Primary, demote the other (if reachable).
       const res = this.drbdRes(set);
       const oldHost = to === 'primary' ? set.secondaryHost : set.primaryHost;
       try {
         const cN = await this.sshCred(activeHost);
         const cO = await this.sshCred(oldHost);
+        // Stage 1 — demote the old primary (best-effort; it may already be gone in a real outage).
         if (cO) await sshRun(oldHost, cO.port, cO.username, cO.password, `drbdadm secondary ${res} 2>/dev/null; echo done`, 30_000).catch(() => undefined);
-        if (cN) { const r = await sshRun(activeHost, cN.port, cN.username, cN.password, `drbdadm primary ${res} 2>&1 || drbdadm primary --force ${res} 2>&1; drbdadm status ${res} 2>&1 | head -8`, 60_000); drbd = (r.stdout || '').trim().slice(0, 600); }
+        // Stage 2 — promote the new primary.
+        if (cN) {
+          const r = await sshRun(activeHost, cN.port, cN.username, cN.password, `drbdadm primary ${res} 2>&1 || drbdadm primary --force ${res} 2>&1; drbdadm status ${res} 2>&1 | head -8`, 60_000);
+          drbd = (r.stdout || '').trim().slice(0, 600);
+          promoted = true;
+        }
       } catch (e) { drbd = `DRBD promote note: ${String((e as Error)?.message ?? e).slice(0, 200)}`; }
+    } else {
+      // Non-block (files/database/docker): promotion is a control-plane state change — the target
+      // already holds the replicated data; there is no role to flip.
+      promoted = true;
     }
+    promotedAt = new Date();
+
     await this.prisma.replicationSet.update({ where: { id }, data: { state } });
-    await this.prisma.eventLog.create({ data: { type: 'finding', severity: 'warning', title: `Replication "${set.name}": promoted ${active || to} (${activeHost}) to ACTIVE. Repoint external DNS to ${activeHost}.` } }).catch(() => undefined);
-    return { ok: true, state, active, activeHost, drbd, hint: `Now repoint your external DNS to ${activeHost}. MCMF does not manage DNS.` };
+
+    // Stage 3 — verify the new primary is actually live (re-parse DRBD status + host health probe).
+    const verify = await this.verifyPromotion(set, to, activeHost, isBlock, promoted).catch((e) => ({
+      drbd: '', drbdPrimary: false, drbdUpToDate: false, healthChecked: false, healthOk: false,
+      detail: `verification error: ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+    }));
+    const verifiedAt = new Date();
+    if (verify.drbd && !drbd) drbd = verify.drbd;
+
+    const outcome = deriveOutcome({
+      promoted, isBlock,
+      drbdPrimary: verify.drbdPrimary, drbdUpToDate: verify.drbdUpToDate,
+      healthChecked: verify.healthChecked, healthOk: verify.healthOk,
+    });
+    // RTO is only meaningful once the new primary is confirmed live.
+    const rtoSeconds = outcome === 'failed' ? null : computeRtoSeconds(triggeredAt, verifiedAt);
+
+    const trial = await this.prisma.failoverTrial.create({
+      data: {
+        replicationSetId: id, triggeredBy: String(triggeredBy || '').slice(0, 200), mode, to,
+        triggeredAt, promotedAt, verifiedAt: outcome === 'failed' ? null : verifiedAt,
+        rpoSeconds: rpoSeconds ?? null, rtoSeconds: rtoSeconds ?? null,
+        outcome, verificationDetail: verify.detail.slice(0, 2000), drbdOutput: (verify.drbd || drbd || '').slice(0, 2000),
+      },
+    }).catch((e) => { this.log.warn(`failoverTrial persist: ${String((e as Error)?.message ?? e)}`); return null as any; });
+
+    await this.prisma.eventLog.create({ data: { type: 'finding', severity: 'warning', title: `Replication "${set.name}": ${mode === 'simulated' ? 'DRILL — ' : ''}promoted ${active || to} (${activeHost}) to ACTIVE [${outcome}, RTO ${rtoSeconds ?? 'n/a'}s, RPO ${rpoSeconds ?? 'n/a'}s]. Repoint external DNS to ${activeHost}.` } }).catch(() => undefined);
+    return { ok: outcome !== 'failed', state, active, activeHost, drbd, outcome, rpoSeconds, rtoSeconds, verification: verify.detail, trialId: trial?.id ?? null, hint: `Now repoint your external DNS to ${activeHost}. MCMF does not manage DNS.` };
+  }
+
+  /**
+   * Post-promote verification. For DRBD sets, re-run `drbdadm status` on the new primary and parse
+   * for role:Primary + disk:UpToDate (independent of the promote command's exit code). For all sets,
+   * run a best-effort app-level health probe (TCP reachability) against the promoted host.
+   */
+  private async verifyPromotion(
+    set: any, to: string, activeHost: string, isBlock: boolean, promoted: boolean,
+  ): Promise<{ drbd: string; drbdPrimary: boolean; drbdUpToDate: boolean; healthChecked: boolean; healthOk: boolean; detail: string }> {
+    let drbd = '', drbdPrimary = false, drbdUpToDate = false;
+    if (isBlock && promoted) {
+      const res = this.drbdRes(set);
+      const c = await this.sshCred(activeHost).catch(() => null);
+      if (c) {
+        const r = await sshRun(activeHost, c.port, c.username, c.password, `drbdadm status ${res} 2>&1 | head -24`, 30_000).catch(() => ({ stdout: '' } as any));
+        drbd = (r.stdout || '').trim().slice(0, 800);
+        const role = parseDrbdRole(drbd);
+        drbdPrimary = role.primary; drbdUpToDate = role.upToDate;
+      }
+    }
+    // App-level health probe: is the promoted host reachable on its SSH/management port? Best-effort —
+    // a probe failure never throws, it just marks the health check as not-passed.
+    const port = 22;
+    const healthOk = activeHost ? await this.tcpProbe(activeHost, port, 5_000) : false;
+    const healthChecked = !!activeHost;
+    const parts: string[] = [];
+    if (isBlock) parts.push(`DRBD role=${drbdPrimary ? 'Primary' : 'not-Primary'}, disk=${drbdUpToDate ? 'UpToDate' : 'not-confirmed'}`);
+    if (healthChecked) parts.push(`host ${activeHost} tcp/${port} ${healthOk ? 'reachable' : 'unreachable'}`);
+    return { drbd, drbdPrimary, drbdUpToDate, healthChecked, healthOk, detail: parts.join('; ') || 'no verification signals available' };
+  }
+
+  /** Best-effort TCP reachability probe (resolves true iff a connection is established within timeout). */
+  private tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const finish = (ok: boolean) => { if (done) return; done = true; try { sock.destroy(); } catch { /* noop */ } resolve(ok); };
+      const sock = netConnect({ host, port });
+      sock.setTimeout(timeoutMs);
+      sock.once('connect', () => finish(true));
+      sock.once('timeout', () => finish(false));
+      sock.once('error', () => finish(false));
+    });
+  }
+
+  /**
+   * Safe failover DRILL: fence the current primary WITHOUT destroying infrastructure, then run the
+   * real promote() path so the trial produces genuine RTO/RPO evidence and is repeatable. For DRBD
+   * sets, fencing = `drbdadm secondary` on the current primary (reversible demotion — a later
+   * "Sync now"/heal re-establishes it). For other sets there is no destructive step; the drill just
+   * exercises the control-plane promotion. Never deletes data, volumes, or VMs.
+   */
+  async simulateFailure(id: string, triggeredBy = '') {
+    const set = await this.prisma.replicationSet.findUnique({ where: { id } });
+    if (!set) throw new BadRequestException('replication set not found');
+    if (set.state !== 'primary-active') throw new BadRequestException(`Set is not primary-active (currently "${set.state}"). Promote it back to primary before drilling again.`);
+    if (!set.secondaryHost) throw new BadRequestException('No secondary VM configured to fail over to.');
+
+    let fenced = 'control-plane only (non-block set — no reversible fence step)';
+    if (set.dataType === 'block') {
+      const res = this.drbdRes(set);
+      const cP = await this.sshCred(set.primaryHost).catch(() => null);
+      if (cP) {
+        // Reversible fence: demote the current primary to Secondary (simulates its loss, no data touched).
+        const r = await sshRun(set.primaryHost, cP.port, cP.username, cP.password, `drbdadm secondary ${res} 2>&1; echo MCMF_FENCED`, 30_000).catch((e) => ({ stdout: `fence note: ${String((e as Error)?.message ?? e)}` } as any));
+        fenced = /MCMF_FENCED/.test(r.stdout || '') ? `fenced primary ${set.primaryHost} (drbdadm secondary ${res})` : `fence attempted on ${set.primaryHost}: ${(r.stdout || '').slice(0, 160)}`;
+      } else {
+        fenced = `primary ${set.primaryHost} unreachable — treated as failed (no SSH credential)`;
+      }
+    }
+    await this.prisma.eventLog.create({ data: { type: 'finding', severity: 'info', title: `Replication "${set.name}": simulated-failover DRILL started — ${fenced}.` } }).catch(() => undefined);
+    // Run the genuine failover to the secondary as a simulated-mode trial.
+    const result = await this.promote(id, 'secondary', triggeredBy, 'simulated');
+    return { ...result, drill: true, fenced };
+  }
+
+  /** Failover-trial history for a set, newest first (auditable RTO/RPO evidence). */
+  async listFailoverTrials(id: string) {
+    const set = await this.prisma.replicationSet.findUnique({ where: { id } });
+    if (!set) throw new BadRequestException('replication set not found');
+    const trials = await this.prisma.failoverTrial.findMany({ where: { replicationSetId: id }, orderBy: { triggeredAt: 'desc' }, take: 100 });
+    return { setId: id, name: set.name, trials };
   }
 }

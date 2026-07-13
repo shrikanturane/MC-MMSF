@@ -429,14 +429,33 @@ export class AzureConnector implements CloudConnector {
     const out: any[] = [];
     try {
       const r = await fetch(`${base}/connections?${av}`, { headers: h });
-      if (r.ok) for (const c of ((await r.json()) as any)?.value ?? []) {
-        const pr = c.properties || {};
-        out.push({
-          provider: 'azure', kind: pr.connectionType === 'ExpressRoute' ? 'expressroute' : 'vpn', id: `${(c.id || '').split('/resourceGroups/')[1]?.split('/providers')[0] || ''}/${c.name}`, name: c.name, region: c.location,
-          managed: c.tags?.createdBy === 'MCMF',
-          status: pr.connectionStatus === 'Connected' ? 'up' : pr.connectionStatus ? 'down' : 'unknown',
-          localAddr: '', remoteAddr: '', remoteSubnets: '',
-          detail: `${pr.connectionType || 'connection'}${pr.connectionStatus ? ' · ' + pr.connectionStatus : ''}`,
+      if (r.ok) {
+        const conns: any[] = ((await r.json()) as any)?.value ?? [];
+        // The connections LIST does NOT populate live connectionStatus (it comes back null); only the
+        // per-connection GET does. Enrich each VPN connection with a best-effort individual GET (in
+        // parallel) so the discovered inventory shows a real up/down instead of "unknown".
+        const live = await Promise.all(conns.map(async (c) => {
+          const isEr = c.properties?.connectionType === 'ExpressRoute';
+          if (isEr || !c.id) return null;
+          try {
+            const g = await fetch(`https://management.azure.com${c.id}?${av}`, { headers: h });
+            if (!g.ok) return null;
+            const gp = ((await g.json()) as any)?.properties || {};
+            return { status: gp.connectionStatus ?? null, ingress: gp.ingressBytesTransferred, egress: gp.egressBytesTransferred };
+          } catch { return null; }
+        }));
+        conns.forEach((c, i) => {
+          const pr = c.properties || {};
+          const liveStatus = live[i]?.status ?? pr.connectionStatus ?? null; // GET wins; fall back to LIST
+          const bytes = live[i] && (live[i]!.ingress != null || live[i]!.egress != null)
+            ? ` · ${live[i]!.ingress ?? 0}B in / ${live[i]!.egress ?? 0}B out` : '';
+          out.push({
+            provider: 'azure', kind: pr.connectionType === 'ExpressRoute' ? 'expressroute' : 'vpn', id: `${(c.id || '').split('/resourceGroups/')[1]?.split('/providers')[0] || ''}/${c.name}`, name: c.name, region: c.location,
+            managed: c.tags?.createdBy === 'MCMF',
+            status: liveStatus === 'Connected' ? 'up' : liveStatus ? 'down' : 'unknown',
+            localAddr: '', remoteAddr: '', remoteSubnets: '',
+            detail: `${pr.connectionType || 'connection'}${liveStatus ? ' · ' + liveStatus : ''}${bytes}`,
+          });
         });
       }
     } catch { /* no perms */ }

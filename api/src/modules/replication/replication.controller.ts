@@ -76,7 +76,19 @@ export class ReplicationController {
 
   @Roles('admin', 'operator')
   @Post(':id/promote')
-  promote(@Param('id') id: string, @Body() body: { to?: 'primary' | 'secondary' | 'tertiary' }) {
-    return this.service.promote(id, body?.to ?? 'secondary');
+  promote(@Param('id') id: string, @Body() body: { to?: 'primary' | 'secondary' | 'tertiary' }, @Req() req: any) {
+    return this.service.promote(id, body?.to ?? 'secondary', req.user?.sub || req.user?.email || '');
+  }
+
+  @Roles('admin', 'operator')
+  @Post(':id/simulate-failure')
+  simulateFailure(@Param('id') id: string, @Req() req: any) {
+    return this.service.simulateFailure(id, req.user?.sub || req.user?.email || '');
+  }
+
+  @Roles('admin', 'operator')
+  @Get(':id/failover-trials')
+  failoverTrials(@Param('id') id: string) {
+    return this.service.listFailoverTrials(id);
   }
 }

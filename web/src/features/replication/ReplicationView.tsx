@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { Card, Modal } from '@/components/ui';
 import { useResources } from '@/lib/hooks';
 import {
@@ -79,10 +79,23 @@ export function ReplicationView() {
                   <span className="ml-auto rounded px-1.5 py-0.5 text-2xs font-medium" style={{ background: st.color + '22', color: st.color }}>{st.label}</span>
                 </div>
                 <div className="mb-2 flex flex-wrap items-center gap-1.5 text-2xs">
-                  <Node label="Primary" name={s.primaryName} host={s.primaryHost} on={s.state === 'primary-active'} />
-                  <span className="text-muted">→</span>
-                  <Node label="Secondary" name={s.secondaryName} host={s.secondaryHost} on={s.state === 'failed-over'} />
-                  {s.tertiaryHost && <><span className="text-muted">→</span><Node label="Tertiary" name={s.tertiaryName} host={s.tertiaryHost} on={s.state === 'tertiary-active'} /></>}
+                  {(() => {
+                    // Order the nodes so the ACTIVE (live source) leads and the arrows flow OUT of it to
+                    // the standby targets — so a failover visibly moves the live VM to the front and
+                    // reverses the replication direction (e.g. Secondary → Primary after failing over).
+                    const nodes = [
+                      { label: 'Primary', name: s.primaryName, host: s.primaryHost, active: s.state === 'primary-active' },
+                      { label: 'Secondary', name: s.secondaryName, host: s.secondaryHost, active: s.state === 'failed-over' },
+                      ...(s.tertiaryHost ? [{ label: 'Tertiary', name: s.tertiaryName, host: s.tertiaryHost, active: s.state === 'tertiary-active' }] : []),
+                    ];
+                    const ordered = [...nodes].sort((a, b) => Number(b.active) - Number(a.active)); // active first (stable otherwise)
+                    return ordered.map((n, i) => (
+                      <Fragment key={n.label}>
+                        {i > 0 && <span className={i === 1 && ordered[0].active ? 'text-success' : 'text-muted'}>→</span>}
+                        <Node label={n.label} name={n.name} host={n.host} on={n.active} role={n.active ? 'source' : 'target'} />
+                      </Fragment>
+                    ));
+                  })()}
                 </div>
                 <div className="mb-2 text-2xs text-muted">
                   {s.dataType === 'files'
@@ -218,10 +231,14 @@ function AgentInstallModal({ host, onClose }: { host: string; onClose: () => voi
   );
 }
 
-function Node({ label, name, host, on }: { label: string; name: string; host: string; on: boolean }) {
+function Node({ label, name, host, on, role }: { label: string; name: string; host: string; on: boolean; role?: 'source' | 'target' }) {
   return (
     <span className={`inline-flex flex-col rounded-lg border px-2 py-1 ${on ? 'border-success/50 bg-success/10' : 'border-border bg-bg'}`}>
-      <span className="flex items-center gap-1"><span className="text-2xs text-muted">{label}</span>{on && <span className="text-2xs text-success">● live</span>}</span>
+      <span className="flex items-center gap-1">
+        <span className="text-2xs text-muted">{label}</span>
+        {on ? <span className="text-2xs text-success">● live</span> : null}
+        {role && <span className={`text-2xs ${role === 'source' ? 'text-success' : 'text-muted'}`}>· {role}</span>}
+      </span>
       <span className="text-2xs text-white">{name || host || '—'}</span>
       <span className="font-mono text-2xs text-muted">{host}</span>
     </span>
