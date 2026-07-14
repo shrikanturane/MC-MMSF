@@ -475,6 +475,37 @@ export class AzureConnector implements CloudConnector {
   }
 
   /**
+   * Tear down a DISCOVERED VPN connection by id ("resourceGroup/connectionName"). Always deletes the
+   * connection; when deleteGateways is set, also deletes the connection's local-network-gateway (the peer
+   * representation) and, best-effort, the virtual-network-gateway (async ~10 min, and refused by Azure if
+   * still used by another connection). Each step is independent and reported.
+   */
+  async teardownVpn(credentials: ProviderCredentials, opts: { id: string; deleteGateways?: boolean }): Promise<string[]> {
+    const { subscriptionId } = this.require(credentials);
+    const token = await getAzureToken(credentials);
+    const h = { authorization: `Bearer ${token}` } as any;
+    const av = 'api-version=2023-09-01';
+    const [rg, name] = String(opts.id || '').split('/');
+    if (!rg || !name) return [`invalid Azure connection id "${opts.id}" (expected resourceGroup/connectionName)`];
+    const base = `https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${rg}/providers/Microsoft.Network`;
+    const done: string[] = [];
+    let lgwId = '', vgwId = '';
+    try {
+      const g = await fetch(`${base}/connections/${name}?${av}`, { headers: h });
+      if (g.ok) { const pr = ((await g.json()) as any)?.properties || {}; lgwId = pr.localNetworkGateway2?.id || ''; vgwId = pr.virtualNetworkGateway1?.id || ''; }
+    } catch { /* lookup best-effort */ }
+    try {
+      const r = await fetch(`${base}/connections/${name}?${av}`, { method: 'DELETE', headers: h });
+      done.push(r.ok || r.status === 202 || r.status === 204 ? `deleted connection ${name}` : `connection: HTTP ${r.status}`);
+    } catch (e) { done.push(`connection: ${(e as Error).message}`); }
+    if (opts.deleteGateways) {
+      if (lgwId) { try { const r = await fetch(`https://management.azure.com${lgwId}?${av}`, { method: 'DELETE', headers: h }); done.push(r.ok || r.status === 202 || r.status === 204 ? `deleted local-network-gateway` : `local-network-gateway: HTTP ${r.status}`); } catch (e) { done.push(`local-network-gateway: ${(e as Error).message}`); } }
+      if (vgwId) { try { const r = await fetch(`https://management.azure.com${vgwId}?${av}`, { method: 'DELETE', headers: h }); done.push(r.ok || r.status === 202 ? `deleting virtual-network-gateway (async ~10 min)` : r.status === 204 ? `deleted virtual-network-gateway` : `virtual-network-gateway: HTTP ${r.status} (in use?)`); } catch (e) { done.push(`virtual-network-gateway: ${(e as Error).message}`); } }
+    }
+    return done;
+  }
+
+  /**
    * Cross-cloud fabric (Azure VPN Gateway). Creates a static Public IP (address known immediately), a
    * GatewaySubnet, and starts a route-based VPN gateway. NOTE: the gateway itself takes ~30-45 minutes to
    * provision; the orchestrator polls provisioningState before creating the connection. EXPERIMENTAL:

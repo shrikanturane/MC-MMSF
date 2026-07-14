@@ -90,6 +90,78 @@ export class VpnService implements OnModuleInit {
     return { items, byProvider: { aws: items.filter((i) => i.provider === 'aws').length, azure: items.filter((i) => i.provider === 'azure').length, gcp: items.filter((i) => i.provider === 'gcp').length }, up: items.filter((i) => i.status === 'up').length, total: items.length };
   }
 
+  /** Resolve the connected CloudConnection (+ decrypted creds) for a discovered item's provider/account. */
+  private async resolveCloudCreds(provider: string, account?: string): Promise<{ cc: any; creds: any }> {
+    const p = String(provider || '').toLowerCase();
+    if (!['aws', 'azure', 'gcp'].includes(p)) throw new BadRequestException(`Unsupported provider "${provider}".`);
+    const conns = await this.prisma.cloudConnection.findMany({ where: { provider: p as any, status: 'connected' } });
+    const cc = (account ? conns.find((c: any) => c.accountRef === account || c.name === account) : null) || conns[0];
+    if (!cc) throw new BadRequestException(`No connected ${p} cloud account found${account ? ` for "${account}"` : ''}.`);
+    let creds: any; try { creds = decryptJson(cc.credentials); } catch { throw new BadRequestException('Cloud credentials could not be read.'); }
+    return { cc, creds };
+  }
+
+  /** Test a DISCOVERED cross-cloud link: authoritative live status straight from the cloud API. */
+  async discoveredTest(body: any) {
+    const provider = String(body?.provider || '').toLowerCase();
+    const id = String(body?.id || '').trim();
+    if (!id) throw new BadRequestException('id is required.');
+    const { creds } = await this.resolveCloudCreds(provider, body?.account);
+    const conn = getConnector(provider) as any;
+    if (typeof conn.vpnConnectionStatus !== 'function') throw new BadRequestException(`${provider} status checks are not supported.`);
+    try {
+      const r = await conn.vpnConnectionStatus(creds, id, body?.region);
+      const tunnels = (r.tunnels || []).map((t: any) => `${t.ip || '?'}: ${t.status}${t.msg ? ` (${t.msg})` : ''}`);
+      return { ok: true, up: r.up, state: r.state, detail: [`state ${r.state}`, ...tunnels].join(' · ') };
+    } catch (e) {
+      return { ok: false, up: false, state: 'error', detail: String((e as Error)?.message ?? e).slice(0, 300) };
+    }
+  }
+
+  /** Adopt a DISCOVERED link as a monitor-only VpnLink so it joins the managed list with ongoing status. */
+  async discoveredAdopt(body: any) {
+    const provider = String(body?.provider || '').toLowerCase();
+    const id = String(body?.id || '').trim();
+    if (!id) throw new BadRequestException('id is required.');
+    await this.resolveCloudCreds(provider, body?.account); // validates the account is connected + readable
+    const existing = await (this.prisma as any).vpnLink.findFirst({ where: { vpnConnId: id } }).catch(() => null);
+    if (existing) return { ok: true, adopted: false, id: existing.id, message: 'Already managed.' };
+    const link = await (this.prisma as any).vpnLink.create({
+      data: {
+        name: String(body?.name || id).slice(0, 80), tech: 'ipsec', manage: 'monitor',
+        mode: 'site-to-site', ikeVersion: 'ikev2', peerType: 'generic',
+        aManual: true, aProvider: provider, aName: `${provider} gateway`, aHost: String(body?.localAddr || '').slice(0, 64), aSubnet: '',
+        bManual: true, bProvider: '', bHost: String(body?.remoteAddr || '').slice(0, 64), bSubnet: String(body?.remoteSubnets || '').slice(0, 200),
+        vpnConnId: id, statusSource: `${provider}-api`,
+        monitorTarget: String(body?.remoteAddr || '').slice(0, 64),
+        psk: encryptJson(randomBytes(24).toString('base64')),
+      },
+    });
+    await this.monitor(link.id).catch(() => undefined); // seed live status immediately
+    return { ok: true, adopted: true, id: link.id };
+  }
+
+  /**
+   * Tear down a DISCOVERED cross-cloud VPN in the cloud account (destructive). Deletes the connection and,
+   * when deleteGateways is set, its gateways too. Best-effort per step; writes an audit event. Confirm on
+   * the client is required before calling this.
+   */
+  async discoveredTeardown(body: any, actor?: any) {
+    const provider = String(body?.provider || '').toLowerCase();
+    const id = String(body?.id || '').trim();
+    if (!id) throw new BadRequestException('id is required.');
+    const deleteGateways = !!body?.deleteGateways;
+    const { creds } = await this.resolveCloudCreds(provider, body?.account);
+    const conn = getConnector(provider) as any;
+    if (typeof conn.teardownVpn !== 'function') throw new BadRequestException(`${provider} VPN teardown is not supported.`);
+    const steps: string[] = await conn.teardownVpn(creds, { id, region: body?.region, deleteGateways });
+    const who = String(actor?.sub || actor?.email || 'unknown');
+    await this.prisma.eventLog.create({ data: { type: 'finding', severity: 'warning', title: `Discovered VPN teardown by ${who} — ${provider} ${id}${deleteGateways ? ' (+gateways)' : ''}: ${steps.join('; ')}`.slice(0, 500) } }).catch(() => undefined);
+    // If this link was adopted into a managed VpnLink, drop that stale monitor record too.
+    await (this.prisma as any).vpnLink.deleteMany({ where: { vpnConnId: id } }).catch(() => undefined);
+    return { ok: true, steps };
+  }
+
   /** Running VMs that have an SSH credential in the Vault — the endpoints MCMF can genuinely reach. */
   async eligibleHosts() {
     const vms = await this.prisma.resource.findMany({ where: { type: 'compute' }, select: { id: true, name: true, provider: true, status: true, properties: true } });

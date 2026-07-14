@@ -6,6 +6,7 @@ import { useResources } from '@/lib/hooks';
 import {
   useReplicationSets, useCreateReplication, useDeleteReplication, useRunReplication, usePromoteReplication, useUpdateReplication, useEnrollAgent, useStopReplication, useTestReplication,
   useVpnLinks, useCreateVpn, useDeleteVpn, useVpnUp, useVpnDown, useVpnLinkStatus, useVpnGatewayTypes, useVpnRequirements, useVpnEligibleHosts, useVpnMonitor, useDiscoveredVpn, type DiscoveredVpn,
+  useTestDiscovered, useAdoptDiscovered, useTeardownDiscovered,
   useFabrics, useCreateFabric, useUpdateFabric, useArmFabric, useRetryFabric, useDeprovisionFabric, useDeleteFabric,
   type ReplicationSet, type ReplicationAgentInfo, type AgentEnroll, type ReplicationTest, type VpnLink, type VpnRequirements, type VpnEligibleHost, type NetworkFabric,
 } from '@/lib/hooks';
@@ -392,6 +393,8 @@ function FabricPanel() {
         <button onClick={() => setShowNew(true)} className="ml-auto rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-white hover:border-brand">+ New fabric</button>
       </div>
       <p className="mb-3 text-2xs text-muted">One governed pipeline provisions a network (VPC/VNet + subnet) and a site-to-site VPN gateway + connection in <b className="text-white">each of two clouds</b> via their APIs, wires them with a shared key, and hands the tunnel to the monitor above. Nothing is created until you <b className="text-white">Arm</b> it. <span className="text-warning">Experimental — the cloud gateway calls need validation on live billing-enabled accounts; Azure&apos;s gateway alone takes ~30–45 min.</span></p>
+      {/* Existing cross-cloud connectivity already in the connected clouds (not just MCMF-created fabrics). */}
+      <DiscoveredVpnSection />
       {!list.length ? (
         <div className="rounded-xl border border-dashed border-border py-6 text-center text-2xs text-muted">No fabrics yet. Create one to provision a cross-cloud network + VPN end to end.</div>
       ) : (
@@ -519,27 +522,61 @@ function DiscoveredVpnSection() {
   return (
     <div className="mb-3">
       <div className="mb-1.5 flex items-center gap-2 text-2xs text-muted">
-        <span>🔎 <b className="text-white">Discovered cross-cloud connectivity</b> — existing links found in your clouds (read-only)</span>
+        <span>🔎 <b className="text-white">Discovered cross-cloud connectivity</b> — existing links found in your clouds</span>
         <span className="rounded bg-bg px-1.5 py-0.5" style={{ color: '#22c55e' }}>{res.up} up</span>
         <span className="rounded bg-bg px-1.5 py-0.5 text-muted-light">{res.total} total</span>
         <button onClick={() => q.refetch()} disabled={q.isFetching} className="ml-auto rounded border border-border bg-card px-2 py-0.5 text-muted-light hover:text-white disabled:opacity-50">{q.isFetching ? '◌' : '↻'} Rescan</button>
       </div>
       <div className="grid gap-2 lg:grid-cols-2">
-        {items.map((it) => (
-          <div key={it.provider + it.id} className="flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-card/40 px-2.5 py-1.5 text-2xs">
-            <span className="h-2 w-2 rounded-full" style={{ background: VPN_COLOR[it.status] ?? '#64748b' }} />
-            <ProvChip p={it.provider} />
-            <span className="font-medium text-white">{it.name}</span>
-            <span className="rounded bg-bg px-1 py-0.5 text-muted">{KIND_LABEL[it.kind] ?? it.kind}</span>
-            {it.managed && <span className="rounded px-1 py-0.5 text-brand" style={{ background: '#3b82f622' }}>MCMF</span>}
-            {it.region && <span className="text-muted">{it.region}</span>}
-            <span className="ml-auto rounded px-1.5 py-0.5 font-medium" style={{ background: (VPN_COLOR[it.status] ?? '#64748b') + '22', color: VPN_COLOR[it.status] ?? '#64748b' }}>{it.status === 'up' ? '● connected' : it.status}</span>
-            {(it.remoteAddr || it.remoteSubnets || it.detail) && (
-              <div className="w-full text-muted">{it.remoteAddr ? <>peer <span className="font-mono text-muted-light">{it.remoteAddr}</span> · </> : null}{it.remoteSubnets ? <>routes <span className="font-mono text-muted-light">{it.remoteSubnets}</span> · </> : null}{it.detail}</div>
-            )}
-          </div>
-        ))}
+        {items.map((it) => <DiscoveredVpnCard key={it.provider + it.id} it={it} />)}
       </div>
+    </div>
+  );
+}
+
+function DiscoveredVpnCard({ it }: { it: DiscoveredVpn }) {
+  const test = useTestDiscovered();
+  const adopt = useAdoptDiscovered();
+  const teardown = useTeardownDiscovered();
+  const [note, setNote] = useState<{ tone: 'ok' | 'bad' | 'info'; text: string } | null>(null);
+  const payload = { provider: it.provider, id: it.id, account: it.account, region: it.region, name: it.name, localAddr: it.localAddr, remoteAddr: it.remoteAddr, remoteSubnets: it.remoteSubnets };
+  const isVpn = it.kind === 'vpn'; // teardown/test target VPN connections/tunnels (not ExpressRoute/Interconnect)
+  const busy = test.isPending || adopt.isPending || teardown.isPending;
+
+  const runTest = () => { setNote({ tone: 'info', text: 'Checking…' }); test.mutate(payload, { onSuccess: (r) => setNote({ tone: r.up ? 'ok' : 'bad', text: r.detail || (r.up ? 'connected' : 'down') }), onError: (e) => setNote({ tone: 'bad', text: String((e as Error).message) }) }); };
+  const runAdopt = () => { setNote({ tone: 'info', text: 'Adopting…' }); adopt.mutate(payload, { onSuccess: (r) => setNote({ tone: 'ok', text: r.adopted ? 'Now managed — see it in the VPN links list below.' : (r.message || 'Already managed.') }), onError: (e) => setNote({ tone: 'bad', text: String((e as Error).message) }) }); };
+  const runTeardown = () => {
+    const gw = confirm(`TEAR DOWN the ${it.provider.toUpperCase()} VPN "${it.name}" (${it.id})?\n\nThis DELETES real infrastructure in your cloud account.\n\nOK = delete the connection AND its gateways.\nCancel here, then use "Delete connection only" if you'd rather keep the gateways.`);
+    if (!gw) return;
+    if (!confirm(`Final confirm: permanently delete ${it.provider.toUpperCase()} ${it.id} and its gateways? This cannot be undone.`)) return;
+    setNote({ tone: 'info', text: 'Tearing down…' });
+    teardown.mutate({ ...payload, deleteGateways: true }, { onSuccess: (r) => setNote({ tone: 'ok', text: (r.steps || []).join(' · ') || 'done' }), onError: (e) => setNote({ tone: 'bad', text: String((e as Error).message) }) });
+  };
+  const runDeleteConnOnly = () => {
+    if (!confirm(`Delete ONLY the ${it.provider.toUpperCase()} VPN connection "${it.name}" (${it.id})?\n\nLeaves the gateways in place. This deletes real cloud infrastructure and cannot be undone.`)) return;
+    setNote({ tone: 'info', text: 'Deleting connection…' });
+    teardown.mutate({ ...payload, deleteGateways: false }, { onSuccess: (r) => setNote({ tone: 'ok', text: (r.steps || []).join(' · ') || 'done' }), onError: (e) => setNote({ tone: 'bad', text: String((e as Error).message) }) });
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-card/40 px-2.5 py-1.5 text-2xs">
+      <span className="h-2 w-2 rounded-full" style={{ background: VPN_COLOR[it.status] ?? '#64748b' }} />
+      <ProvChip p={it.provider} />
+      <span className="font-medium text-white">{it.name}</span>
+      <span className="rounded bg-bg px-1 py-0.5 text-muted">{KIND_LABEL[it.kind] ?? it.kind}</span>
+      {it.managed && <span className="rounded px-1 py-0.5 text-brand" style={{ background: '#3b82f622' }}>MCMF</span>}
+      {it.region && <span className="text-muted">{it.region}</span>}
+      <span className="ml-auto rounded px-1.5 py-0.5 font-medium" style={{ background: (VPN_COLOR[it.status] ?? '#64748b') + '22', color: VPN_COLOR[it.status] ?? '#64748b' }}>{it.status === 'up' ? '● connected' : it.status}</span>
+      {(it.remoteAddr || it.remoteSubnets || it.detail) && (
+        <div className="w-full text-muted">{it.remoteAddr ? <>peer <span className="font-mono text-muted-light">{it.remoteAddr}</span> · </> : null}{it.remoteSubnets ? <>routes <span className="font-mono text-muted-light">{it.remoteSubnets}</span> · </> : null}{it.detail}</div>
+      )}
+      <div className="flex w-full flex-wrap items-center gap-1 pt-1">
+        {isVpn && <button onClick={runTest} disabled={busy} className="rounded border border-brand/40 bg-brand/10 px-1.5 py-0.5 text-brand hover:bg-brand/20 disabled:opacity-50">✓ Test</button>}
+        {!it.managed && <button onClick={runAdopt} disabled={busy} className="rounded border border-border bg-card px-1.5 py-0.5 text-muted-light hover:text-white disabled:opacity-50">＋ Manage</button>}
+        {isVpn && <button onClick={runDeleteConnOnly} disabled={busy} className="rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 text-warning hover:bg-warning/20 disabled:opacity-50">Delete connection</button>}
+        {isVpn && <button onClick={runTeardown} disabled={busy} className="rounded border border-danger/40 bg-danger/10 px-1.5 py-0.5 text-danger hover:bg-danger/20 disabled:opacity-50">⤓ Tear down</button>}
+      </div>
+      {note && <div className={`w-full break-words rounded px-1.5 py-0.5 ${note.tone === 'ok' ? 'text-success' : note.tone === 'bad' ? 'text-danger' : 'text-muted-light'}`}>{note.text}</div>}
     </div>
   );
 }

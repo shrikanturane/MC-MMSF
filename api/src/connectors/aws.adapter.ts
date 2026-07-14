@@ -5,6 +5,7 @@ import {
   DescribeSecurityGroupsCommand,
   DescribeVpcsCommand,
   DescribeVpnConnectionsCommand,
+  DescribeVpnGatewaysCommand,
   DescribeCustomerGatewaysCommand,
   CreateVpnGatewayCommand,
   AttachVpnGatewayCommand,
@@ -235,9 +236,9 @@ export class AwsConnector implements CloudConnector {
   }
 
   /** Authoritative Site-to-Site VPN tunnel status for the Replication/DR VPN monitor. */
-  async vpnConnectionStatus(credentials: ProviderCredentials, vpnId: string): Promise<{ up: boolean; state: string; tunnels: { ip: string; status: string; msg: string }[] }> {
+  async vpnConnectionStatus(credentials: ProviderCredentials, vpnId: string, region?: string): Promise<{ up: boolean; state: string; tunnels: { ip: string; status: string; msg: string }[] }> {
     this.creds = credentials;
-    const ec2 = new EC2Client(this.clientConfig());
+    const ec2 = new EC2Client(this.clientConfig(region));
     const res = await ec2.send(new DescribeVpnConnectionsCommand({ VpnConnectionIds: [vpnId] }));
     const c = res.VpnConnections?.[0];
     const tels = c?.VgwTelemetry ?? [];
@@ -279,6 +280,37 @@ export class AwsConnector implements CloudConnector {
       } catch { /* region not enabled / no perms */ }
     }));
     return out;
+  }
+
+  /**
+   * Tear down a DISCOVERED site-to-site VPN connection by id (vpn-xxxx). Always deletes the connection;
+   * when deleteGateways is set, also deletes its customer gateway and detaches+deletes its VGW. Best-effort
+   * per step — a gateway still used by another connection fails safely (AWS DependencyViolation) and is
+   * reported rather than forced.
+   */
+  async teardownVpn(credentials: ProviderCredentials, opts: { id: string; region?: string; deleteGateways?: boolean }): Promise<string[]> {
+    this.creds = credentials;
+    const ec2 = new EC2Client(this.clientConfig(opts.region));
+    const done: string[] = [];
+    let cgwId = '', vgwId = '';
+    try {
+      const d = await ec2.send(new DescribeVpnConnectionsCommand({ VpnConnectionIds: [opts.id] }));
+      const c = d.VpnConnections?.[0];
+      cgwId = c?.CustomerGatewayId ?? ''; vgwId = c?.VpnGatewayId ?? '';
+    } catch (e) { done.push(`lookup: ${(e as Error).message}`); }
+    try { await ec2.send(new DeleteVpnConnectionCommand({ VpnConnectionId: opts.id })); done.push(`deleted vpn-connection ${opts.id}`); }
+    catch (e) { done.push(`connection: ${(e as Error).message}`); }
+    if (opts.deleteGateways) {
+      if (cgwId) { try { await ec2.send(new DeleteCustomerGatewayCommand({ CustomerGatewayId: cgwId })); done.push(`deleted customer-gateway ${cgwId}`); } catch (e) { done.push(`customer-gateway ${cgwId}: ${(e as Error).message}`); } }
+      if (vgwId) {
+        try {
+          const g = await ec2.send(new DescribeVpnGatewaysCommand({ VpnGatewayIds: [vgwId] }));
+          for (const att of g.VpnGateways?.[0]?.VpcAttachments ?? []) { if (att.VpcId) await ec2.send(new DetachVpnGatewayCommand({ VpnGatewayId: vgwId, VpcId: att.VpcId })).catch(() => undefined); }
+        } catch { /* detach best-effort */ }
+        try { await ec2.send(new DeleteVpnGatewayCommand({ VpnGatewayId: vgwId })); done.push(`deleted vpn-gateway ${vgwId}`); } catch (e) { done.push(`vpn-gateway ${vgwId}: ${(e as Error).message}`); }
+      }
+    }
+    return done;
   }
 
   /**

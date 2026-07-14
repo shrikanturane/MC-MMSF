@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Req } from '@nestjs/common';
 import { Roles } from '../../auth/roles.decorator';
 import { VpnService } from './vpn.service';
 
@@ -24,6 +24,23 @@ export class VpnController {
   @Get('discovered')
   discovered() {
     return this.service.discovered();
+  }
+
+  @Post('discovered/test')
+  discoveredTest(@Body() body: any) {
+    return this.service.discoveredTest(body ?? {});
+  }
+
+  @Roles('admin', 'operator')
+  @Post('discovered/adopt')
+  discoveredAdopt(@Body() body: any) {
+    return this.service.discoveredAdopt(body ?? {});
+  }
+
+  @Roles('admin', 'operator')
+  @Post('discovered/teardown')
+  discoveredTeardown(@Body() body: any, @Req() req: any) {
+    return this.service.discoveredTeardown(body ?? {}, req.user);
   }
 
   @Post('requirements')

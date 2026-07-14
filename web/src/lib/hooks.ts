@@ -1010,6 +1010,10 @@ export const useVpnEligibleHosts = () => useQuery({ queryKey: ['vpn-eligible'], 
 export interface DiscoveredVpn { provider: string; kind: string; id: string; name: string; region?: string; account?: string; status: string; managed?: boolean; localAddr?: string; remoteAddr?: string; remoteSubnets?: string; detail?: string }
 export interface DiscoveredVpnResult { items: DiscoveredVpn[]; byProvider: { aws: number; azure: number; gcp: number }; up: number; total: number }
 export const useDiscoveredVpn = () => useQuery({ queryKey: ['vpn-discovered'], queryFn: () => apiGet<DiscoveredVpnResult>('/vpn/discovered'), refetchInterval: 30000 });
+export interface DiscoveredActionResult { ok: boolean; up?: boolean; state?: string; detail?: string; steps?: string[]; adopted?: boolean; message?: string }
+export const useTestDiscovered = () => useMutation({ mutationFn: (b: Record<string, unknown>) => apiPost<DiscoveredActionResult>('/vpn/discovered/test', b) });
+export const useAdoptDiscovered = () => { const qc = useQueryClient(); return useMutation({ mutationFn: (b: Record<string, unknown>) => apiPost<DiscoveredActionResult>('/vpn/discovered/adopt', b), onSuccess: () => { qc.invalidateQueries({ queryKey: ['vpn'] }); qc.invalidateQueries({ queryKey: ['vpn-discovered'] }); } }); };
+export const useTeardownDiscovered = () => { const qc = useQueryClient(); return useMutation({ mutationFn: (b: Record<string, unknown>) => apiPost<DiscoveredActionResult>('/vpn/discovered/teardown', b), onSuccess: () => { qc.invalidateQueries({ queryKey: ['vpn'] }); qc.invalidateQueries({ queryKey: ['vpn-discovered'] }); } }); };
 export const useVpnRequirements = () => useMutation({ mutationFn: (b: Record<string, unknown>) => apiPost<VpnRequirements>('/vpn/requirements', b) });
 const useVpnMutation = <T,>(fn: (v: T) => Promise<unknown>) => {
   const qc = useQueryClient();

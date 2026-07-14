@@ -243,6 +243,30 @@ export class GcpConnector implements CloudConnector {
   }
 
   /**
+   * Tear down a DISCOVERED Cloud VPN tunnel by id ("region/tunnelName"). Always deletes the tunnel; when
+   * deleteGateways is set, also deletes the target VPN gateway the tunnel referenced (best-effort — GCP
+   * refuses while other tunnels/forwarding-rules still use it, which is reported, not forced).
+   */
+  async teardownVpn(credentials: ProviderCredentials, opts: { id: string; deleteGateways?: boolean }): Promise<string[]> {
+    const { token, project } = await getGcpToken(credentials);
+    const base = `https://compute.googleapis.com/compute/v1/projects/${project}`;
+    const h = { authorization: `Bearer ${token}` } as any;
+    const [region, name] = String(opts.id || '').split('/');
+    if (!region || !name) return [`invalid GCP tunnel id "${opts.id}" (expected region/tunnelName)`];
+    const done: string[] = [];
+    // Read the tunnel first so we know which target gateway it used (for the optional gateway delete).
+    let gwName = '';
+    try {
+      const r = await fetch(`${base}/regions/${region}/vpnTunnels/${name}`, { headers: h });
+      if (r.ok) gwName = String(((await r.json()) as any)?.targetVpnGateway || '').split('/').pop() || '';
+    } catch { /* best-effort */ }
+    const del = async (url: string, label: string) => { try { const r = await fetch(url, { method: 'DELETE', headers: h }); done.push(r.ok || r.status === 404 ? `deleted ${label}` : `${label}: HTTP ${r.status}`); } catch (e) { done.push(`${label}: ${(e as Error).message}`); } };
+    await del(`${base}/regions/${region}/vpnTunnels/${name}`, `vpnTunnel ${name}`);
+    if (opts.deleteGateways && gwName) await del(`${base}/regions/${region}/targetVpnGateways/${gwName}`, `targetVpnGateway ${gwName}`);
+    return done;
+  }
+
+  /**
    * Cross-cloud fabric (GCP Classic Cloud VPN). Reserves a regional external IP, creates a target VPN
    * gateway on the network, and adds ESP/UDP-500/UDP-4500 forwarding rules. Returns the assigned public IP.
    * EXPERIMENTAL: unverified against a live billing-enabled project; calls are best-effort and idempotent-ish.
