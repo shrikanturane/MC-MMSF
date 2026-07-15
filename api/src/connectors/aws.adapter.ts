@@ -579,28 +579,48 @@ export class AwsConnector implements CloudConnector {
       const cidr = (spec.cidr || '10.30.0.0/16').trim();
       const ec2 = new EC2Client(this.clientConfig(region));
 
-      let vpcId: string | undefined;
+      // REUSE an existing same-named MCMF VPC. Fabric teardown leaves networks in place, so a re-arm
+      // (or a rebuild after tearing a fabric down) must reuse that VPC rather than create a duplicate and
+      // burn the 5-VPC/region quota. Reusing also lets a fabric consume one of the existing networks.
+      let vpcId: string | undefined; let reused = false;
       try {
-        const vpc = await ec2.send(new CreateVpcCommand({
-          CidrBlock: cidr,
-          TagSpecifications: [{ ResourceType: 'vpc', Tags: [{ Key: 'Name', Value: spec.name }, { Key: 'createdBy', Value: 'MCMF' }] }],
-        }));
-        vpcId = vpc.Vpc?.VpcId;
-      } catch (e) {
-        throw awsProvisionError('VPC create', e);
+        const found = await ec2.send(new DescribeVpcsCommand({ Filters: [{ Name: 'tag:Name', Values: [spec.name] }] }));
+        vpcId = found.Vpcs?.[0]?.VpcId; // deleted VPCs don't appear in results
+        if (vpcId) reused = true;
+      } catch { /* no describe perm → fall through to create */ }
+      if (!vpcId) {
+        try {
+          const vpc = await ec2.send(new CreateVpcCommand({
+            CidrBlock: cidr,
+            TagSpecifications: [{ ResourceType: 'vpc', Tags: [{ Key: 'Name', Value: spec.name }, { Key: 'createdBy', Value: 'MCMF' }] }],
+          }));
+          vpcId = vpc.Vpc?.VpcId;
+        } catch (e) {
+          throw awsProvisionError('VPC create', e);
+        }
       }
 
       const subnetCidr = (spec.subnetCidr || '').trim() || awsDefaultSubnet(cidr);
-      try {
-        await ec2.send(new CreateSubnetCommand({
-          VpcId: vpcId,
-          CidrBlock: subnetCidr,
-          TagSpecifications: [{ ResourceType: 'subnet', Tags: [{ Key: 'Name', Value: `${spec.name}-subnet` }, { Key: 'createdBy', Value: 'MCMF' }] }],
-        }));
-      } catch (e) {
-        throw awsProvisionError('Subnet create', e);
+      // Only create the subnet if the (reused) VPC doesn't already have one — avoids a CIDR-overlap error.
+      let haveSubnet = false;
+      if (reused) {
+        try {
+          const subs = await ec2.send(new DescribeSubnetsCommand({ Filters: [{ Name: 'vpc-id', Values: [vpcId as string] }] }));
+          haveSubnet = (subs.Subnets?.length ?? 0) > 0;
+        } catch { /* fall through and try to create */ }
       }
-      return { ok: true, detail: `Created VPC "${spec.name}" (${cidr}, subnet ${subnetCidr}) ${vpcId} in ${region}.`, externalId: vpcId };
+      if (!haveSubnet) {
+        try {
+          await ec2.send(new CreateSubnetCommand({
+            VpcId: vpcId,
+            CidrBlock: subnetCidr,
+            TagSpecifications: [{ ResourceType: 'subnet', Tags: [{ Key: 'Name', Value: `${spec.name}-subnet` }, { Key: 'createdBy', Value: 'MCMF' }] }],
+          }));
+        } catch (e) {
+          if (!reused) throw awsProvisionError('Subnet create', e); // on reuse an existing/overlapping subnet is fine
+        }
+      }
+      return { ok: true, detail: `${reused ? 'Reusing' : 'Created'} VPC "${spec.name}" (${cidr}, subnet ${subnetCidr}) ${vpcId} in ${region}.`, externalId: vpcId };
     }
 
     if (spec.kind === 'vm') {
