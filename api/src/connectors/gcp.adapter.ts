@@ -497,12 +497,18 @@ export class GcpConnector implements CloudConnector {
         throw new ProvisionError('invalid network name', 'Validate input', 'Use lowercase letters, digits and hyphens; must start with a letter (e.g. prod-vpc).');
       }
       const { token, project } = await getGcpToken(credentials);
-      const res = await fetch(`https://compute.googleapis.com/compute/v1/projects/${encodeURIComponent(project)}/global/networks`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ name, autoCreateSubnetworks: true, description: 'Created by MCMF' }),
-      });
-      if (!res.ok) throw gcpProvisionError('VPC network create', res.status, await res.text());
+      const h = { authorization: `Bearer ${token}`, 'content-type': 'application/json' } as any;
+      const netUrl = `https://compute.googleapis.com/compute/v1/projects/${encodeURIComponent(project)}/global/networks`;
+      // REUSE an existing same-named network. Fabric teardown leaves the network in place, so a re-arm /
+      // rebuild must reuse it rather than 409 on create — and so a fabric can use one of the existing networks.
+      const existing = await fetch(`${netUrl}/${encodeURIComponent(name)}`, { headers: h }).catch(() => null);
+      if (existing?.ok) return { ok: true, detail: `Reusing existing VPC network "${name}" in project ${project}.`, externalId: name };
+      const res = await fetch(netUrl, { method: 'POST', headers: h, body: JSON.stringify({ name, autoCreateSubnetworks: true, description: 'Created by MCMF' }) });
+      if (!res.ok) {
+        const txt = await res.text();
+        if (res.status === 409 || /alreadyExists/i.test(txt)) return { ok: true, detail: `Reusing existing VPC network "${name}" in project ${project}.`, externalId: name };
+        throw gcpProvisionError('VPC network create', res.status, txt);
+      }
       return { ok: true, detail: `Created VPC network "${name}" (auto subnets) in project ${project} — provisioning.`, externalId: name };
     }
 
