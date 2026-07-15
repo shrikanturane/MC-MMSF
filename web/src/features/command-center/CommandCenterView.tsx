@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { Badge, Card, ErrorState, LoadingState, ProgressBar, StatCard } from '@/components/ui';
-import { useCommandCenter, useAiStatus, useAiAssistant, useRca, useUpdateAgent, useRemoveAgent, useEnqueueAgentCommand, useEnrollPull, useAgents, useAgentPullNow, useAgentPushAgent, useVms, useMonitors } from '@/lib/hooks';
+import { useCommandCenter, useAiStatus, useAiAssistant, useRca, useUpdateAgent, useRemoveAgent, useEnqueueAgentCommand, useEnrollPull, useAgents, useAgentPullNow, useAgentPushAgent, useVms, useMonitors, useOptimizationInsights, useGenerateOptimization, useApplyOptimization, useDismissOptimization, type OptimizationRecommendation } from '@/lib/hooks';
 import { useAuthUser } from '@/lib/auth';
 import { PROVIDER_COLORS, SEVERITY_COLORS, STATUS_COLORS, number, pct, timeAgo } from '@/lib/format';
 import type { CommandCenterOverview } from '@/lib/types';
@@ -133,6 +133,9 @@ export function CommandCenterView() {
           </div>
         </Card>
 
+        {/* Layer 12 — recommendations derived from AIOps + governance + alert config. */}
+        <OptimizationPanel />
+
         {/* Active incidents — kept at the bottom of Command Center. */}
         <Card title="Active Incidents" className="col-span-12" bodyClassName="p-0">
           <div className="divide-y divide-border-soft">
@@ -153,6 +156,81 @@ export function CommandCenterView() {
         </Card>
       </div>
     </div>
+  );
+}
+
+const OPT_SOURCE_COLORS: Record<string, string> = { aiops: '#a855f7', governance: '#3b82f6', finops: '#22c55e' };
+
+/**
+ * Layer 12 — Continuous Feedback & Optimisation. Rule-derived proposals from the AIOps/governance/alert
+ * signal. Approve writes the change back into the control plane (admin only); Dismiss keeps the row as a
+ * record of what was considered. Empty is the normal state on a healthy fleet.
+ */
+function OptimizationPanel() {
+  const { data: me } = useAuthUser();
+  const insights = useOptimizationInsights('pending');
+  const generate = useGenerateOptimization();
+  const apply = useApplyOptimization();
+  const dismiss = useDismissOptimization();
+  const [err, setErr] = useState('');
+  const items = insights.data ?? [];
+  const isAdmin = me?.role === 'admin';
+  const busy = apply.isPending || dismiss.isPending || generate.isPending;
+
+  return (
+    <Card
+      title="Optimisation"
+      className="col-span-12"
+      bodyClassName="p-0"
+      action={
+        <button
+          onClick={() => { setErr(''); generate.mutate(undefined as never, { onError: (e) => setErr(String((e as Error).message)) }); }}
+          disabled={busy}
+          className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white disabled:opacity-50"
+        >
+          {generate.isPending ? '◌ Analysing…' : '↻ Generate now'}
+        </button>
+      }
+    >
+      {err && <div className="mx-4 mt-3 break-words rounded border border-danger/30 bg-danger/10 px-2 py-1 text-2xs text-danger">{err}</div>}
+      <div className="divide-y divide-border-soft">
+        {items.length === 0 && (
+          <div className="px-4 py-6 text-center text-2xs text-muted">
+            {insights.isLoading ? 'Loading…' : 'No pending recommendations — nothing in the current anomaly, violation and alert-rule data meets a rule threshold.'}
+          </div>
+        )}
+        {items.map((r: OptimizationRecommendation) => (
+          <div key={r.id} className="flex flex-wrap items-start justify-between gap-3 px-4 py-3 hover:bg-card-hover">
+            <div className="min-w-0 flex-1">
+              <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                <Badge color={OPT_SOURCE_COLORS[r.source] ?? '#64748b'} tone="dot">{r.source}</Badge>
+                <span className="rounded bg-bg px-1.5 py-0.5 text-2xs text-muted-light">{r.category}</span>
+                <span className="text-sm font-medium text-white">{r.title}</span>
+              </div>
+              <div className="text-2xs text-muted">{r.description}</div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {isAdmin && (
+                <button
+                  onClick={() => { setErr(''); apply.mutate(r.id, { onError: (e) => setErr(String((e as Error).message)) }); }}
+                  disabled={busy}
+                  className="rounded-md border border-success/50 bg-success/10 px-2.5 py-1 text-2xs font-medium text-success hover:bg-success/20 disabled:opacity-50"
+                >
+                  ✓ Approve
+                </button>
+              )}
+              <button
+                onClick={() => { setErr(''); dismiss.mutate(r.id, { onError: (e) => setErr(String((e as Error).message)) }); }}
+                disabled={busy}
+                className="rounded-md border border-border bg-card px-2.5 py-1 text-2xs text-muted-light hover:text-white disabled:opacity-50"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 

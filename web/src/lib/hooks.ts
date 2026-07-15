@@ -435,6 +435,29 @@ export const useCommandCenter = () =>
     refetchInterval: 8000,
   });
 
+// ── Layer 12: Continuous Feedback & Optimisation ──────────────────────────
+export interface OptimizationRecommendation {
+  id: string; source: string; category: string; title: string; description: string;
+  proposedChange: { target: string; targetId?: string; field: string; newValue: unknown };
+  status: string; createdAt: string; appliedAt: string | null; appliedBy: string | null;
+}
+export const useOptimizationInsights = (status = 'pending') =>
+  useQuery({
+    queryKey: ['optimization', status],
+    queryFn: () => apiGet<OptimizationRecommendation[]>(`/optimization/insights?status=${status}`),
+    refetchInterval: 30000,
+  });
+const useOptimizationMutation = <T,>(fn: (v: T) => Promise<unknown>) => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['optimization'] }); qc.invalidateQueries({ queryKey: ['command-center'] }); },
+  });
+};
+export const useGenerateOptimization = () => useOptimizationMutation(() => apiPost('/optimization/generate', {}));
+export const useApplyOptimization = () => useOptimizationMutation((id: string) => apiPost(`/optimization/${id}/apply`, {}));
+export const useDismissOptimization = () => useOptimizationMutation((id: string) => apiPost(`/optimization/${id}/dismiss`, {}));
+
 export const useSettings = () =>
   useQuery({ queryKey: ['settings'], queryFn: () => apiGet<SettingsData>('/settings') });
 

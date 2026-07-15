@@ -11,5 +11,6 @@ import { AiModule } from '../ai/ai.module';
   imports: [AlertingModule, AiModule],
   controllers: [AiopsController],
   providers: [AiopsService, ValidationService],
+  exports: [AiopsService], // optimization (Layer 12) reads the anomaly feed to derive recommendations
 })
 export class AiopsModule {}
