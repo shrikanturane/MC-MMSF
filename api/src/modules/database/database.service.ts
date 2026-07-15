@@ -22,6 +22,10 @@ const ENV_ROLES = ['development', 'test', 'production']; // server/node environm
 // replacing their data can't orphan prod's operational rows. Prod's identity/2FA, cloud
 // connections, discovered resources, agents, credentials, integrations and history are PRESERVED
 // (never in this list) — that fixes the "2FA re-prompt" + "prod VMs disappear" problems.
+/** Written on the TARGET after a verified successful rebuild — the source of truth for "what does prod
+ *  actually run?". The skip-the-rebuild check reads THIS, never a hash held on the deploying server. */
+const DEPLOY_MARKER = '~/mcmf/.mcmf-deployed-hash';
+
 const CONFIG_REPLACE_TABLES = [
   'AlertRule', 'AutomationWorkflow', 'EscalationPolicy', 'Policy', 'ApprovalPolicy',
   'ComplianceFramework', 'ComplianceItem', 'DashboardLayout', 'Report', 'Budget',
@@ -943,14 +947,20 @@ Repeat steps 1–3 with the roles reversed (old primary ${primary} becomes the s
     try {
       await this.appendDeployLog(id, `Promoting Development → Production (config only) → ${host} …`, 3);
       // 1 · deploy dev's CODE without wiping data — but ONLY if it changed since the last deploy.
-      //     A content hash of the source is compared to what was last shipped to this node; if nothing
-      //     changed we SKIP the (multi-minute) ship + rebuild and just promote config. Much faster.
+      //     The skip decision asks the TARGET what it is actually running (a marker written on prod only
+      //     after a VERIFIED successful rebuild), NOT a hash held on this server. A source-side hash claims
+      //     "prod has X" even when prod's build failed or prod was rebuilt from an older image — which
+      //     silently skips every future deploy and strands production on stale code. Unreadable/absent
+      //     marker => treat as changed and ship (fail safe).
       const node = await this.prisma.clusterNode.findUnique({ where: { id } });
       const { manifest, hash: srcHash } = await this.sourceFingerprint();
       const org0 = await this.prisma.orgSettings.findUnique({ where: { id: 1 } }).catch(() => null);
       const cl = this.changelogFor(((org0 as any)?.sourceManifest ?? {}) as Record<string, string>, manifest);
       const changes = cl.summary;
-      const codeUnchanged = !!srcHash && (node as any)?.lastDeployHash === srcHash;
+      const remoteHash = (
+        await sshRun(host, port, user, pass, `cat ${DEPLOY_MARKER} 2>/dev/null || true`, 30_000).catch(() => ({ stdout: '' }))
+      ).stdout.trim();
+      const codeUnchanged = !!srcHash && remoteHash === srcHash;
       if (codeUnchanged) {
         await this.appendDeployLog(id, '⏩ Code unchanged since the last deploy — skipping rebuild (config-only promotion, much faster).', 82);
       } else {
@@ -963,18 +973,30 @@ Repeat steps 1–3 with the roles reversed (old primary ${primary} becomes the s
         await sshRun(host, port, user, pass, `cd ~/mcmf && rm -f /tmp/mcmf-deploy.log; nohup sh -c 'DOCKER_BUILDKIT=0 docker compose up --build -d > /tmp/mcmf-deploy.log 2>&1; echo MCMF_BUILD_DONE=$? >> /tmp/mcmf-deploy.log' >/dev/null 2>&1 </dev/null & echo started`, 20_000).catch(() => undefined);
         const deadline = Date.now() + 18 * 60_000;
         const buildStart = Date.now(), buildSpan = 18 * 60_000;
-        let finished = false;
+        let finished = false, buildCode: string | null = null;
         while (Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 15_000));
           // Interpolate the build phase across 25→80% so the bar keeps advancing while compiling.
           const pct = 25 + Math.min(55, ((Date.now() - buildStart) / buildSpan) * 55);
           await this.appendDeployLog(id, 'Rebuilding …', pct).catch(() => undefined);
           const p = await sshRun(host, port, user, pass, `sed -n 's/^MCMF_BUILD_DONE=//p' /tmp/mcmf-deploy.log 2>/dev/null | tail -1`, 40_000).catch(() => null);
-          if (p && p.stdout.trim() !== '') { finished = true; break; }
+          if (p && p.stdout.trim() !== '') { finished = true; buildCode = p.stdout.trim(); break; }
         }
         if (!finished) { await this.appendDeployLog(id, '❌ Code rebuild timed out.'); await this.prisma.clusterNode.update({ where: { id }, data: { deployStatus: 'failed' } }); return; }
+        // The marker only tells us the build FINISHED — its exit code says whether it SUCCEEDED. A failed
+        // build (e.g. no disk space) leaves the previous containers running, so the later "containers up"
+        // check would pass and we'd record a successful deploy while prod still runs the OLD image — and,
+        // worse, stamp the new hash so every future deploy skips. Treat a non-zero build as fatal.
+        if (buildCode !== '0') {
+          const tail = await sshRun(host, port, user, pass, `tail -25 /tmp/mcmf-deploy.log 2>/dev/null`, 40_000).catch(() => ({ stdout: '' } as any));
+          await this.appendDeployLog(id, `❌ Code rebuild FAILED on ${host} (exit ${buildCode}) — production is still running the PREVIOUS build; nothing was promoted.\n${String(tail.stdout || '').slice(-900)}`);
+          await this.prisma.clusterNode.update({ where: { id }, data: { deployStatus: 'failed' } });
+          return;
+        }
         // wait for the DB to be ready (api applied prisma db push on restart).
         await sshRun(host, port, user, pass, `for i in $(seq 1 40); do docker exec mcmf-std-db pg_isready -U mcmf -d mcmf 2>/dev/null | grep -q accepting && break; sleep 3; done`, 180_000).catch(() => undefined);
+        // Record on the TARGET what it now actually runs — this is what the next deploy's skip check reads.
+        await sshRun(host, port, user, pass, `printf '%s' ${shq(srcHash)} > ${DEPLOY_MARKER}`, 30_000).catch(() => undefined);
       }
       // 2 · promote ONLY the config tables (prod's data preserved).
       await this.appendDeployLog(id, 'Promoting config (alert rules, automations, policies, dashboards, branding) …', 88);
