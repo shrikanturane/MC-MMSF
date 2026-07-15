@@ -348,6 +348,7 @@ model OptimizationRecommendation {
   createdAt      DateTime  @default(now())
   appliedAt      DateTime?
   appliedBy      String?
+  dismissedAt    DateTime? // starts a cooldown so a rejected proposal isn't re-raised on the next loop
 
   @@index([status, createdAt])
 }

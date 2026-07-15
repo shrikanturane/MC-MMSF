@@ -68,9 +68,17 @@ export class OptimizationService implements OnModuleInit {
         now: new Date(),
       });
 
-      // De-duplicate against what's already pending, and against workflows a previous apply() already created.
-      const pending = await this.prisma.optimizationRecommendation.findMany({ where: { status: 'pending' }, select: { dedupeKey: true } });
-      const pendingKeys = new Set(pending.map((p) => p.dedupeKey));
+      // De-duplicate against what's already pending, against proposals the operator recently DISMISSED
+      // (otherwise a rejected proposal returns on the very next loop and dismiss never sticks), and against
+      // workflows a previous apply() already created. Applied ones are NOT suppressed: if the condition
+      // genuinely comes back, it should be raised again.
+      const cooldownDays = pInt(await sysParams(this.prisma), 'optimizationDismissCooldownDays', 'OPTIMIZATION_DISMISS_COOLDOWN_DAYS', 7);
+      const cooldownFrom = new Date(Date.now() - Math.max(1, cooldownDays) * 86_400_000);
+      const suppressed = await this.prisma.optimizationRecommendation.findMany({
+        where: { OR: [{ status: 'pending' }, { status: 'dismissed', dismissedAt: { gte: cooldownFrom } }] },
+        select: { dedupeKey: true },
+      });
+      const pendingKeys = new Set(suppressed.map((p) => p.dedupeKey));
       const workflowNames = new Set(workflows.map((w) => w.name));
       const fresh = candidates.filter((c) => {
         if (pendingKeys.has(c.key)) return false;
@@ -165,12 +173,16 @@ export class OptimizationService implements OnModuleInit {
     }
   }
 
-  /** Dismiss = this proposal isn't wanted. Keeps the row as an audit trail of what was considered. */
+  /**
+   * Dismiss = this proposal isn't wanted. The row is kept as an audit trail of what was considered, and
+   * dismissedAt starts a cooldown (optimizationDismissCooldownDays, default 7) so the loop doesn't re-raise
+   * the same proposal minutes later. After the cooldown it can return if the condition still holds.
+   */
   async dismiss(id: string) {
     const rec = await this.prisma.optimizationRecommendation.findUnique({ where: { id } });
     if (!rec) throw new NotFoundException('recommendation not found');
     if (rec.status !== 'pending') throw new BadRequestException(`recommendation already ${rec.status}`);
-    await this.prisma.optimizationRecommendation.update({ where: { id }, data: { status: 'dismissed' } });
+    await this.prisma.optimizationRecommendation.update({ where: { id }, data: { status: 'dismissed', dismissedAt: new Date() } });
     return { ok: true, id, status: 'dismissed' };
   }
 }
