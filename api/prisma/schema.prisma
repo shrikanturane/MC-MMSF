@@ -333,6 +333,26 @@ model AnomalyDetection {
   @@index([resourceId, detectorType, metric, detectedAt])
 }
 
+// Layer 12 (Continuous Feedback & Optimisation): a rule-derived proposal to change the control plane —
+// tighten a Policy, add an AlertRule, or add an AutomationWorkflow. Every row is derived from real
+// anomaly/violation/rule data at generate() time; apply() performs the write and stamps who/when.
+model OptimizationRecommendation {
+  id             String    @id @default(cuid())
+  source         String // aiops | governance | finops
+  category       String // policy-tighten | idle-rightsizing | alert-rule-add
+  title          String
+  description    String
+  proposedChange Json // { target: "Policy"|"AlertRule"|"AutomationWorkflow", targetId?, field, newValue }
+  dedupeKey      String    @default("") // source+category+target — blocks duplicate pending proposals
+  status         String    @default("pending") // pending | applied | dismissed
+  createdAt      DateTime  @default(now())
+  appliedAt      DateTime?
+  appliedBy      String?
+  dismissedAt    DateTime? // starts a cooldown so a rejected proposal isn't re-raised on the next loop
+
+  @@index([status, createdAt])
+}
+
 model AutomationWorkflow {
   id           String         @id @default(cuid())
   name         String

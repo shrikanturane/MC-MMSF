@@ -30,6 +30,7 @@ import { ConsoleModule } from './modules/console/console.module';
 import { AgentModule } from './modules/agent/agent.module';
 import { AiModule } from './modules/ai/ai.module';
 import { AiopsModule } from './modules/aiops/aiops.module';
+import { OptimizationModule } from './modules/optimization/optimization.module';
 import { CiemModule } from './modules/ciem/ciem.module';
 import { ZeroTrustModule } from './modules/zerotrust/zerotrust.module';
 import { VaultModule } from './modules/vault/vault.module';
@@ -79,6 +80,7 @@ import { AuthModule } from './auth/auth.module';
     AgentModule,
     AiModule,
     AiopsModule,
+    OptimizationModule,
     CiemModule,
     ZeroTrustModule,
     VaultModule,
