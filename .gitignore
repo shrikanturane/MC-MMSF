@@ -34,3 +34,5 @@ vsfix.tar
 
 # Test coverage reports
 coverage
+web/package-lock.json
+web/tsconfig.tsbuildinfo

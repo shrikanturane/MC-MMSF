@@ -31,7 +31,9 @@ services:
       # Seal key for stored cloud credentials (AES-256-GCM) + JWT signing. REQUIRED — no default.
       # Generate a strong, STABLE value once: `openssl rand -hex 32` (put it in .env). The API
       # refuses to start without it (rotating it invalidates every stored cloud connection).
-      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?set APP_ENCRYPTION_KEY in .env — run: openssl rand -hex 32}
+      # Quoted: the :? default message contains "run:" — an unquoted colon-space here makes YAML read a
+      # nested mapping ("mapping values are not allowed"), which breaks `docker compose` entirely.
+      APP_ENCRYPTION_KEY: "${APP_ENCRYPTION_KEY:?set APP_ENCRYPTION_KEY in .env - run openssl rand -hex 32}"
       # DEMO_SEED=0 (default) → clean install, no sample data. Set DEMO_SEED=1 to load the demo dataset.
       DEMO_SEED: ${DEMO_SEED:-0}
       # SMTP for the email notification channel (optional — email skipped if SMTP_HOST unset).
@@ -78,6 +80,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Shared backup volume — the Database panel lists backups and can trigger pg_dump on demand.
       - mcmf-backups:/backups
+      - mcmf-recordings:/recordings
       # The platform's own source (read-only) so HA auto-deploy can ship an exact copy of what's
       # running to a new replica over SSH — no GitHub access/token needed.
       - ./:/opt/mcmf-src:ro
@@ -149,6 +152,12 @@ services:
   nginx:
     image: nginx:alpine
     container_name: mcmf-std-nginx
+    # nginx.conf is bind-mounted, so `docker compose up -d` does NOT recreate this container when only the
+    # config file content changes — it would keep serving the old config (a deploy shipped a new nginx.conf
+    # but the running container stayed on the stale mounted inode). Bump this label whenever nginx.conf
+    # changes so the service definition differs and compose recreates nginx, re-resolving the bind mount.
+    labels:
+      - "mcmf.nginxconf=media-audio-v1"
     ports:
       - "80:80"
       - "443:443"
@@ -186,6 +195,7 @@ services:
 volumes:
   mcmf-std-db:
   mcmf-backups:
+  mcmf-recordings:
   mcmf-clickhouse:
   mcmf-tf-work:
   mcmf-tf-plugins:

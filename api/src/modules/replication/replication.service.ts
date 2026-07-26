@@ -5,8 +5,17 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { sshRun } from '../database/ssh-deploy';
 import { decryptJson, encryptJson } from '../../connectors/crypto';
 import { computeRpoSeconds, computeRtoSeconds, deriveOutcome, parseDrbdRole } from './failover-metrics';
+import {
+  guardDirection,
+  isCopyEngine,
+  needsReconcile,
+  reconcileDirection,
+  resolveEndpoints,
+  scheduledDirection,
+  type Dir,
+} from './direction';
 
-type Dir = 'p2s' | 'p2t' | 's2t';
+export type { Dir };
 
 /**
  * Replication-agent build version. Baked into the served scripts (Linux + Windows) and returned on
@@ -38,29 +47,41 @@ export class ReplicationService implements OnModuleInit {
     setInterval(() => this.fastTick().catch((e) => this.log.warn(`fastTick: ${String((e as Error)?.message ?? e)}`)), 15_000);
   }
 
+  /**
+   * Scheduled/async sets. The state filter is deliberately wider than 'primary-active' now: a set that
+   * is failed over still has a live node taking writes, and it used to get NO replication in either
+   * direction (measured: two trials waited 17 minutes, longer than the interval, and saw none). Which
+   * direction — if any — is due is decided by the pure `scheduledDirection`, which returns s2p only for
+   * sets that opted into reverse replication.
+   */
   private async tick() {
-    const sets = await this.prisma.replicationSet.findMany({ where: { enabled: true, state: 'primary-active' } }).catch(() => []);
+    const sets = await this.prisma.replicationSet.findMany({ where: { enabled: true, state: { in: ['primary-active', 'failed-over'] } } }).catch(() => []);
     const now = Date.now();
     for (const s of sets) {
       if (this.running.has(s.id)) continue;
       if (s.driver === 'agent') continue; // agent-driven: the installed agent runs it locally + reports
       if (s.mode === 'sync' && s.dataType !== 'block') continue; // near-sync handled by fastTick (block heals here)
+      // DRBD sets still heal here regardless of state; copy engines follow the direction rules.
+      const dir = s.dataType === 'block' ? 'p2s' : scheduledDirection(s);
+      if (!dir) continue;
       const dueEvery = s.mode === 'scheduled' ? s.intervalMin : Math.max(1, Math.min(s.intervalMin, 5)); // async ships deltas more often
       const last = s.lastRunAt ? s.lastRunAt.getTime() : 0;
-      if (now - last >= dueEvery * 60_000) this.runNow(s.id, 'p2s').catch(() => undefined);
+      if (now - last >= dueEvery * 60_000) this.runNow(s.id, dir).catch(() => undefined);
     }
   }
 
   /** Near-sync: run mode=sync sets (rsync/dump/docker) every intervalSec (default 30s, min 10s). */
   private async fastTick() {
-    const sets = await this.prisma.replicationSet.findMany({ where: { enabled: true, state: 'primary-active', mode: 'sync', driver: { not: 'agent' } } }).catch(() => []);
+    const sets = await this.prisma.replicationSet.findMany({ where: { enabled: true, state: { in: ['primary-active', 'failed-over'] }, mode: 'sync', driver: { not: 'agent' } } }).catch(() => []);
     const now = Date.now();
     for (const s of sets) {
       if (s.dataType === 'block') continue; // DRBD is continuous — no periodic copy
       if (this.running.has(s.id)) continue;
+      const dir = scheduledDirection(s);
+      if (!dir) continue;
       const everySec = s.intervalSec > 0 ? Math.max(10, s.intervalSec) : 30;
       const last = s.lastRunAt ? s.lastRunAt.getTime() : 0;
-      if (now - last >= everySec * 1000) this.runNow(s.id, 'p2s').catch(() => undefined);
+      if (now - last >= everySec * 1000) this.runNow(s.id, dir).catch(() => undefined);
     }
   }
 
@@ -126,6 +147,7 @@ export class ReplicationService implements OnModuleInit {
       sourcePath: s.sourcePath, targetPath: s.targetPath, dbEngine: s.dbEngine, dbName: s.dbName, dbUser: s.dbUser, dockerVolumes: s.dockerVolumes, driver: s.driver, intervalMin: s.intervalMin, intervalSec: s.intervalSec,
       blockDevice: s.blockDevice, blockDeviceB: s.blockDeviceB, drbdPort: s.drbdPort, drbdMinor: s.drbdMinor, drbdMount: s.drbdMount,
       enabled: s.enabled, status: this.running.has(s.id) ? 'running' : s.status, state: s.state,
+      reverseReplication: s.reverseReplication, lastReverseOkAt: s.lastReverseOkAt?.toISOString() ?? null,
       lastError: s.lastError,
       primaryAgent: agentFor(s.primaryHost), secondaryAgent: agentFor(s.secondaryHost),
       lagSeconds: s.lastOkAt ? Math.round((now - s.lastOkAt.getTime()) / 1000) : null,
@@ -200,6 +222,9 @@ export class ReplicationService implements OnModuleInit {
     if (body.drbdPort !== undefined) data.drbdPort = Math.max(1, Math.min(65535, Number(body.drbdPort) || 7789));
     if (body.drbdMinor !== undefined) data.drbdMinor = Math.max(0, Math.min(255, Number(body.drbdMinor) || 0));
     if (body.enabled !== undefined) data.enabled = !!body.enabled;
+    // Opt-in reverse (secondary -> primary) replication while failed over. Off by default: a DRILL also
+    // parks a set in 'failed-over', where the primary may still be live and would be overwritten.
+    if (body.reverseReplication !== undefined) data.reverseReplication = !!body.reverseReplication;
     return this.prisma.replicationSet.update({ where: { id }, data });
   }
 
@@ -266,10 +291,26 @@ export class ReplicationService implements OnModuleInit {
       // live SSH probe from MCMF (only meaningful for Linux + when we have creds; best-effort)
       if (cred && os === 'linux') {
         try {
-          const r = await sshRun(ep.host, cred.port, cred.username, cred.password, 'echo MCMF_OK; command -v rsync >/dev/null 2>&1 && echo HAS_RSYNC; command -v pg_dump >/dev/null 2>&1 && echo HAS_PGDUMP; command -v docker >/dev/null 2>&1 && echo HAS_DOCKER', 20_000);
+          const r = await sshRun(ep.host, cred.port, cred.username, cred.password, 'echo MCMF_OK; command -v rsync >/dev/null 2>&1 && echo HAS_RSYNC; command -v sshpass >/dev/null 2>&1 && echo HAS_SSHPASS; command -v pg_dump >/dev/null 2>&1 && echo HAS_PGDUMP; command -v docker >/dev/null 2>&1 && echo HAS_DOCKER', 20_000);
           const out = r.stdout || '';
           const reachable = /MCMF_OK/.test(out);
           add('MCMF → host SSH', ep.host, reachable, reachable ? 'info' : set.driver === 'agent' ? 'warn' : 'error', reachable ? 'reachable' : 'MCMF cannot open SSH to this host (expected for private/NAT hosts under the agent driver).');
+          // The copy tools must exist on every host that could EVER be the source, not just today's.
+          // A two-node copy set sources from the primary (p2s) and, after a failover, from the secondary
+          // (s2p) — so a secondary without rsync/sshpass silently has no way to hand its work back, and
+          // you find out during a fail-back, which is the worst possible moment. Checked up front now.
+          const couldSource = ep.isSource || (isCopyEngine(set.dataType) && (ep.role === 'primary' || ep.role === 'secondary'));
+          if (reachable && couldSource && set.driver === 'orchestrated' && set.dataType === 'files') {
+            const has = /HAS_SSHPASS/.test(out);
+            add(ep.isSource ? 'sshpass on source' : 'sshpass on standby source', ep.host, has, has ? 'info' : ep.isSource ? 'error' : 'warn',
+              has ? 'present' : ep.isSource
+                ? 'sshpass not found — rsync over password SSH needs it. Install it, or use key-based credentials.'
+                : `sshpass not found on ${ep.host}. Replication works today, but this host becomes the SOURCE after a failover — without sshpass, fail-back cannot carry its changes back and will be refused. Install it now, not during an outage.`);
+          }
+          if (reachable && couldSource && !ep.isSource && set.dataType === 'files') {
+            const has = /HAS_RSYNC/.test(out);
+            if (!has) add('rsync on standby source', ep.host, false, 'warn', `rsync not found on ${ep.host} — it becomes the source after a failover; without it, fail-back cannot reconcile.`);
+          }
           if (reachable && ep.isSource) {
             if (set.dataType === 'files') add('rsync on source', ep.host, /HAS_RSYNC/.test(out), /HAS_RSYNC/.test(out) ? 'info' : 'error', /HAS_RSYNC/.test(out) ? 'present' : 'rsync not found — install it on the source.');
             if (set.dataType === 'database') add('DB client on source', ep.host, /HAS_PGDUMP/.test(out), /HAS_PGDUMP/.test(out) ? 'info' : 'warn', /HAS_PGDUMP/.test(out) ? 'pg_dump present' : 'pg_dump/mysqldump not detected on the source.');
@@ -350,6 +391,13 @@ export class ReplicationService implements OnModuleInit {
   async runNow(id: string, direction: Dir = 'p2s') {
     const set = await this.prisma.replicationSet.findUnique({ where: { id } });
     if (!set) throw new BadRequestException('replication set not found');
+    // Never copy ONTO the node that is currently serving. This is the single choke point for the
+    // scheduler, the operator's "Sync now", and fail-back reconciliation alike: the engines run
+    // `rsync -az --delete`, so a copy aimed at the live node deletes live data rather than adding stale
+    // files. Measured before this guard existed: pressing "Sync now" mid-outage destroyed the
+    // secondary's in-flight work (rsync reported "Number of deleted files: 1").
+    const guard = guardDirection(set, direction);
+    if (!guard.ok) throw new BadRequestException(guard.reason);
     if (this.running.has(id)) return { ok: false, detail: 'A run is already in progress for this set.' };
     this.running.add(id);
     const run = await this.prisma.replicationRun.create({ data: { setId: id, direction } });
@@ -361,7 +409,7 @@ export class ReplicationService implements OnModuleInit {
         const r = await this.provisionDrbd(set);
         ok = r.ok; detail = r.detail;
       } else if (set.dataType === 'database') {
-        const [srcHost, tgtHost] = direction === 'p2t' ? [set.primaryHost, set.tertiaryHost] : direction === 's2t' ? [set.secondaryHost, set.tertiaryHost] : [set.primaryHost, set.secondaryHost];
+        const { srcHost, tgtHost } = resolveEndpoints(set, direction);
         if (!srcHost || !tgtHost) throw new Error('Source/target host is not set on this replication set.');
         const srcCred = await this.sshCred(srcHost);
         const tgtCred = await this.sshCred(tgtHost);
@@ -394,7 +442,7 @@ export class ReplicationService implements OnModuleInit {
         if (!/MCMF_RESTORED/.test(r2.stdout)) throw new Error('Restore failed on the target.');
         ok = true;
       } else if (set.dataType === 'docker') {
-        const [srcHost, tgtHost] = direction === 'p2t' ? [set.primaryHost, set.tertiaryHost] : direction === 's2t' ? [set.secondaryHost, set.tertiaryHost] : [set.primaryHost, set.secondaryHost];
+        const { srcHost, tgtHost } = resolveEndpoints(set, direction);
         if (!srcHost || !tgtHost) throw new Error('Source/target host is not set on this replication set.');
         const srcCred = await this.sshCred(srcHost);
         const tgtCred = await this.sshCred(tgtHost);
@@ -428,15 +476,17 @@ export class ReplicationService implements OnModuleInit {
         if (!/MCMF_DIMPORT_OK/.test(r2.stdout)) throw new Error('Volume import failed on the target.');
         ok = true;
       } else {
-        const [srcHost, tgtHost] = direction === 'p2t' ? [set.primaryHost, set.tertiaryHost] : direction === 's2t' ? [set.secondaryHost, set.tertiaryHost] : [set.primaryHost, set.secondaryHost];
+        const { srcHost, tgtHost, srcPath, tgtPath } = resolveEndpoints(set, direction);
         if (!srcHost || !tgtHost) throw new Error('Source/target host is not set on this replication set.');
         const srcCred = await this.sshCred(srcHost);
         const tgtCred = await this.sshCred(tgtHost);
         if (!srcCred) throw new Error(`No SSH credential for the source host ${srcHost} — add it in Credential Vault.`);
         if (!tgtCred) throw new Error(`No SSH credential for the target host ${tgtHost} — add it in Credential Vault.`);
         const q = (s: string) => s.replace(/'/g, "'\\''");
-        const src = q(set.sourcePath || '/var/www');
-        const tgt = q(set.targetPath || set.sourcePath || '/var/www');
+        // Paths follow the ROLE, not the direction: the primary holds sourcePath, replicas hold
+        // targetPath. So s2p reads the secondary's targetPath and writes the primary's sourcePath.
+        const src = q(srcPath);
+        const tgt = q(tgtPath);
         const cmd =
           `command -v rsync >/dev/null 2>&1 || { echo MCMF_NO_RSYNC; exit 11; }; ` +
           `command -v sshpass >/dev/null 2>&1 || { echo MCMF_NO_SSHPASS; exit 12; }; ` +
@@ -456,8 +506,19 @@ export class ReplicationService implements OnModuleInit {
     }
     const durationMs = Date.now() - t0;
     await this.prisma.replicationRun.update({ where: { id: run.id }, data: { finishedAt: new Date(), ok, durationMs, detail } }).catch(() => undefined);
-    await this.prisma.replicationSet.update({ where: { id }, data: { status: ok ? 'healthy' : 'failed', lastOkAt: ok ? new Date() : undefined, lastError: ok ? '' : detail } }).catch(() => undefined);
-    return { ok, detail, durationMs };
+    // lastOkAt is the FORWARD (primary -> replica) watermark and the RPO baseline promote() reads. A
+    // reverse run protects different data in the other direction, so it gets its own watermark — letting
+    // s2p stamp lastOkAt would make a failover's RPO look freshly synced when the forward copy is stale.
+    const okStamp = ok ? new Date() : undefined;
+    await this.prisma.replicationSet.update({
+      where: { id },
+      data: {
+        status: ok ? 'healthy' : 'failed',
+        ...(direction === 's2p' ? { lastReverseOkAt: okStamp } : { lastOkAt: okStamp }),
+        lastError: ok ? '' : detail,
+      },
+    }).catch(() => undefined);
+    return { ok, detail, durationMs, direction };
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -885,6 +946,7 @@ export class ReplicationService implements OnModuleInit {
     to: 'primary' | 'secondary' | 'tertiary',
     triggeredBy = '',
     mode: 'real' | 'simulated' = 'real',
+    force = false,
   ) {
     const set = await this.prisma.replicationSet.findUnique({ where: { id } });
     if (!set) throw new BadRequestException('replication set not found');
@@ -893,6 +955,49 @@ export class ReplicationService implements OnModuleInit {
     // Stage 0 — trigger. Capture RPO baseline (last known-good replication) BEFORE any mutation.
     const triggeredAt = new Date();
     const rpoSeconds = computeRpoSeconds(set.lastOkAt, triggeredAt);
+
+    // Stage 0b — FAIL-BACK RECONCILIATION.
+    //
+    // Returning to the primary after a failover is the one transition with unreplicated data on the far
+    // side: while failed over the secondary has been taking writes, and for a copy engine nothing has
+    // carried them back. Measured before this existed: 7 of 7 fail-back trials lost that data — always,
+    // by construction, not probabilistically. So carry it back FIRST and refuse to promote if we can't.
+    //
+    // Refusing is the point. A fail-back that "succeeds" while silently discarding the outage's work is
+    // worse than one that stops and says why; the operator can still force it once they've decided the
+    // secondary's writes are expendable.
+    let reconciled: boolean | null = null;
+    let reconcileDetail = '';
+    if (needsReconcile(set, to)) {
+      const dir = reconcileDirection(set);
+      if (mode === 'simulated') {
+        reconciled = null;
+        reconcileDetail = 'Drill (mode=simulated): reconciliation skipped so the drill cannot mutate the primary.';
+      } else if (!dir) {
+        reconciled = null;
+        reconcileDetail = 'No reconciliation needed for this data type.';
+      } else {
+        const r = await this.runNow(id, dir).catch((e) => ({ ok: false, detail: String((e as Error)?.message ?? e) } as any));
+        reconciled = !!r?.ok;
+        reconcileDetail = `${dir} reconciliation ${r?.ok ? 'OK' : 'FAILED'}: ${String(r?.detail ?? '').slice(0, 600)}`;
+        if (!reconciled && !force) {
+          await this.prisma.failoverTrial.create({
+            data: {
+              replicationSetId: id, triggeredBy: String(triggeredBy || '').slice(0, 200), mode, to,
+              triggeredAt, promotedAt: null, verifiedAt: null,
+              rpoSeconds: rpoSeconds ?? null, rtoSeconds: null,
+              outcome: 'failed', reconciled: false, reconcileDetail: reconcileDetail.slice(0, 2000),
+              verificationDetail: 'Fail-back aborted before promotion: the secondary\'s writes could not be carried back.',
+            },
+          }).catch(() => undefined);
+          throw new BadRequestException(
+            `Fail-back aborted: could not carry the secondary's changes back to the primary, so completing it ` +
+            `would silently discard everything written during the outage. ${reconcileDetail} ` +
+            `Fix the primary's reachability and retry, or re-run with force=true to fail back anyway and accept that loss.`,
+          );
+        }
+      }
+    }
 
     const state = to === 'primary' ? 'primary-active' : to === 'tertiary' ? 'tertiary-active' : 'failed-over';
     const active = to === 'primary' ? set.primaryName : to === 'tertiary' ? set.tertiaryName : set.secondaryName;
@@ -948,12 +1053,13 @@ export class ReplicationService implements OnModuleInit {
         replicationSetId: id, triggeredBy: String(triggeredBy || '').slice(0, 200), mode, to,
         triggeredAt, promotedAt, verifiedAt: outcome === 'failed' ? null : verifiedAt,
         rpoSeconds: rpoSeconds ?? null, rtoSeconds: rtoSeconds ?? null,
-        outcome, verificationDetail: verify.detail.slice(0, 2000), drbdOutput: (verify.drbd || drbd || '').slice(0, 2000),
+        outcome, reconciled, reconcileDetail: reconcileDetail.slice(0, 2000),
+        verificationDetail: verify.detail.slice(0, 2000), drbdOutput: (verify.drbd || drbd || '').slice(0, 2000),
       },
     }).catch((e) => { this.log.warn(`failoverTrial persist: ${String((e as Error)?.message ?? e)}`); return null as any; });
 
     await this.prisma.eventLog.create({ data: { type: 'finding', severity: 'warning', title: `Replication "${set.name}": ${mode === 'simulated' ? 'DRILL — ' : ''}promoted ${active || to} (${activeHost}) to ACTIVE [${outcome}, RTO ${rtoSeconds ?? 'n/a'}s, RPO ${rpoSeconds ?? 'n/a'}s]. Repoint external DNS to ${activeHost}.` } }).catch(() => undefined);
-    return { ok: outcome !== 'failed', state, active, activeHost, drbd, outcome, rpoSeconds, rtoSeconds, verification: verify.detail, trialId: trial?.id ?? null, hint: `Now repoint your external DNS to ${activeHost}. MCMF does not manage DNS.` };
+    return { ok: outcome !== 'failed', state, active, activeHost, drbd, outcome, rpoSeconds, rtoSeconds, reconciled, reconcileDetail, verification: verify.detail, trialId: trial?.id ?? null, hint: `Now repoint your external DNS to ${activeHost}. MCMF does not manage DNS.` };
   }
 
   /**

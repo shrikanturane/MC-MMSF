@@ -4,6 +4,7 @@ import { useState, type ReactNode } from 'react';
 import { AreaTrend, CategoryBar, CategoryPie } from '@/components/charts';
 import { IpMonitorPanel } from '@/features/monitors/IpMonitorPanel';
 import { NetworkDevicesPanel } from '@/features/monitors/NetworkDevicesPanel';
+import { UptimeSlaPanel, UptimeSummaryCard } from '@/features/monitors/UptimePanel';
 import { ComplianceDetail } from '@/features/compliance/ComplianceDetail';
 import { VmsTable } from '@/features/vms/VmsTable';
 import { RulesManager } from '@/features/management/RulesManager';
@@ -83,6 +84,8 @@ export const WIDGET_CATALOG: { kind: string; label: string; desc: string }[] = [
   { kind: 'audit', label: 'Security Audit Trail', desc: 'Who did what, when, from where (Activity).' },
   { kind: 'ai-anomaly-feed', label: 'Anomaly Feed', desc: 'Cost / behaviour / threshold detections with confirm-dismiss review (AI Engine).' },
   { kind: 'ai-anomaly-quality', label: 'Anomaly Detection Quality', desc: 'Rolling precision, FP-rate, recall & MTTD + control-trial runner (AI Engine).' },
+  { kind: 'uptime-sla', label: 'Device Uptime & SLA', desc: 'Availability per device (agents, IP/host monitors, cloud VMs) with hours-up-per-day, outage times and SLA verdict; click a row to drill down.' },
+  { kind: 'uptime-summary', label: 'Fleet SLA Summary', desc: 'Average availability, how many devices are meeting the SLA, and the worst offenders.' },
   { kind: 'ai-validation', label: 'Validation Suite', desc: 'Thesis test matrix with live evidence — anomaly battery, RCA top-k, correlation, CIEM (AI Engine).' },
 ];
 
@@ -96,6 +99,8 @@ export function defaultSize(kind: string): { w: number; h: number } {
     case 'vms': return { w: 12, h: 9 };
     case 'rules': return { w: 12, h: 6 };
     case 'ipmon': return { w: 6, h: 9 };
+    case 'uptime-sla': return { w: 12, h: 10 };
+    case 'uptime-summary': return { w: 5, h: 8 };
     case 'netdevices': return { w: 12, h: 9 };
     case 'events':
     case 'incidents':
@@ -206,6 +211,8 @@ export function WidgetContent({ panel, onConfig }: { panel: BoardPanel; onConfig
     case 'ai-anomaly-feed': return <AnomalyFeedPanel />;
     case 'ai-anomaly-quality': return <AnomalyQualityCard />;
     case 'ai-validation': return <ValidationPanel />;
+    case 'uptime-sla': return <UptimeSlaPanel bare />;
+    case 'uptime-summary': return <UptimeSummaryCard />;
     case 'events': return <Events />;
     case 'vms': return <VmsTable bare />;
     case 'rules': return <RulesManager bare />;

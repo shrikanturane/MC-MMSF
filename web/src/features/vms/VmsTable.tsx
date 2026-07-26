@@ -1,10 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Card, ErrorState, LoadingState, Modal, ProviderBadge, StatusBadge } from '@/components/ui';
-import { useVms, useControlVm } from '@/lib/hooks';
+import { useVms, useControlVm, useAgents } from '@/lib/hooks';
 import { TOKEN_KEY } from '@/lib/api';
 import { pct } from '@/lib/format';
+import { RemoteSupportModal } from '@/features/remote/RemoteSupportModal';
 import type { VmRow } from '@/lib/types';
 
 export type VmAction = 'start' | 'stop' | 'reboot';
@@ -26,6 +27,29 @@ export function VmsTable({ embedded = false, bare = false }: { embedded?: boolea
   const [deleting, setDeleting] = useState<VmRow | null>(null);
   const [delBusy, setDelBusy] = useState(false);
   const [msg, setMsg] = useState<{ id: string; text: string; ok: boolean } | null>(null);
+
+  // ── Filters ── so a long fleet can be narrowed to the machine you want without scrolling.
+  const [q, setQ] = useState('');
+  const [fProvider, setFProvider] = useState('');
+  const [fStatus, setFStatus] = useState('');
+  const [fGroup, setFGroup] = useState('');
+  const providers = useMemo(() => Array.from(new Set((data ?? []).map((v) => v.provider))).sort(), [data]);
+  const statuses = useMemo(() => Array.from(new Set((data ?? []).map((v) => v.status))).sort(), [data]);
+  const groups = useMemo(() => Array.from(new Set((data ?? []).map((v) => v.group || 'default'))).sort(), [data]);
+  const rows = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return (data ?? []).filter((v) => {
+      if (fProvider && v.provider !== fProvider) return false;
+      if (fStatus && v.status !== fStatus) return false;
+      if (fGroup && (v.group || 'default') !== fGroup) return false;
+      if (needle) {
+        const hay = `${v.name} ${v.os} ${v.region} ${v.publicIp ?? ''} ${v.privateIp ?? ''} ${v.group ?? ''}`.toLowerCase();
+        if (!hay.includes(needle)) return false;
+      }
+      return true;
+    });
+  }, [data, q, fProvider, fStatus, fGroup]);
+  const anyFilter = !!(q || fProvider || fStatus || fGroup);
 
   // Delete files a governed approval (not an immediate action) — the VM is removed only after approval.
   const runDelete = async () => {
@@ -78,6 +102,31 @@ export function VmsTable({ embedded = false, bare = false }: { embedded?: boolea
     </div>
   ) : (
     <div className="overflow-x-auto">
+      {/* Filter bar — narrows a big fleet fast so you don't scroll to find a machine. */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-2">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="🔎 Search name, IP, OS, region…"
+          className="min-w-[180px] flex-1 rounded-md border border-border bg-bg px-2.5 py-1.5 text-2xs text-white placeholder:text-muted focus:border-brand focus:outline-none"
+        />
+        <select value={fGroup} onChange={(e) => setFGroup(e.target.value)} className="rounded-md border border-border bg-bg px-2 py-1.5 text-2xs text-muted-light focus:border-brand focus:outline-none" title="Filter by device group">
+          <option value="">All groups</option>
+          {groups.map((g) => <option key={g} value={g}>{g}</option>)}
+        </select>
+        <select value={fProvider} onChange={(e) => setFProvider(e.target.value)} className="rounded-md border border-border bg-bg px-2 py-1.5 text-2xs text-muted-light focus:border-brand focus:outline-none" title="Filter by provider">
+          <option value="">All providers</option>
+          {providers.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+        <select value={fStatus} onChange={(e) => setFStatus(e.target.value)} className="rounded-md border border-border bg-bg px-2 py-1.5 text-2xs text-muted-light focus:border-brand focus:outline-none" title="Filter by state">
+          <option value="">All states</option>
+          {statuses.map((st) => <option key={st} value={st}>{st}</option>)}
+        </select>
+        <span className="text-2xs text-muted">{rows.length}/{data.length}</span>
+        {anyFilter && (
+          <button onClick={() => { setQ(''); setFProvider(''); setFStatus(''); setFGroup(''); }} className="rounded-md border border-border bg-bg px-2 py-1.5 text-2xs text-muted-light hover:text-white">Clear</button>
+        )}
+      </div>
       <table className="w-full text-sm">
         <thead className="sticky top-0 z-10 bg-card">
           <tr className="border-b border-border text-left text-2xs uppercase tracking-wide text-muted">
@@ -92,7 +141,10 @@ export function VmsTable({ embedded = false, bare = false }: { embedded?: boolea
           </tr>
         </thead>
         <tbody>
-          {data.map((vm) => {
+          {rows.length === 0 && (
+            <tr><td colSpan={8} className="px-4 py-8 text-center text-2xs text-muted">No machines match these filters. <button onClick={() => { setQ(''); setFProvider(''); setFStatus(''); setFGroup(''); }} className="text-brand hover:underline">Clear filters</button></td></tr>
+          )}
+          {rows.map((vm) => {
             const running = vm.status === 'running';
             const stopped = vm.status === 'stopped' || vm.status === 'terminated';
             return (
@@ -266,6 +318,12 @@ function ConnectableRow({
   msg: { text: string; ok: boolean } | null;
   children: React.ReactNode;
 }) {
+  // When a row's connect options expand, bring them into view so the operator never has to hunt/scroll
+  // for the "Remote support (main screen)" button on a long list — the selection shows on the same screen.
+  const openRowRef = useRef<HTMLTableRowElement | null>(null);
+  useEffect(() => {
+    if (open) openRowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [open]);
   return (
     <>
       <tr className="border-b border-border-soft last:border-0 hover:bg-card-hover">{children}</tr>
@@ -277,7 +335,7 @@ function ConnectableRow({
         </tr>
       )}
       {open && (
-        <tr>
+        <tr ref={openRowRef}>
           <td colSpan={8} className="bg-bg/40 px-4 py-3">
             <ConnectPanel vm={vm} />
           </td>
@@ -344,7 +402,30 @@ function ConnectPanel({ vm }: { vm: VmRow }) {
     );
   }
   const ip = vm.publicIp || vm.privateIp || null;
-  const isWin = String(vm.os ?? '').toLowerCase().includes('win');
+  const osl = String(vm.os ?? '').toLowerCase();
+  const isWin = osl.includes('win');
+  const isMac = osl.includes('mac') || osl.includes('darwin') || osl.includes('osx');
+
+  // Remote support (the MAIN monitor, with the user's permission) needs a live guest agent on this
+  // host -- RDP opens a separate session and signs the console user out, which is the opposite of what
+  // this is for. Match the VM to a fresh Windows agent by name or reported IP, the same way topology
+  // does, and only offer the button when one exists.
+  const agents = useAgents();
+  const [remote, setRemote] = useState(false);
+  const remoteAgent = useMemo(() => {
+    if (!isWin) return null;
+    const list = agents.data ?? [];
+    const ips = [vm.publicIp, vm.privateIp].filter(Boolean) as string[];
+    return list.find((a) => {
+      const fresh = a.lastSeenAt && Date.now() - new Date(a.lastSeenAt).getTime() < 5 * 60_000;
+      if (!fresh || !/^win/i.test(String(a.os || ''))) return false;
+      const names = [a.hostname, a.name, a.displayName].filter(Boolean).map((x) => String(x).toLowerCase());
+      if (names.includes(String(vm.name || '').toLowerCase())) return true;
+      const aIps = Array.isArray(a.ips) ? a.ips.map((x) => String(x).trim()).filter(Boolean) : [];
+      return ips.some((i) => aIps.includes(i));
+    }) ?? null;
+  }, [agents.data, isWin, vm.name, vm.publicIp, vm.privateIp]);
+
   if (!ip) return <div className="text-2xs text-muted">No reachable IP — start the VM or attach a public IP.</div>;
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -353,12 +434,32 @@ function ConnectPanel({ vm }: { vm: VmRow }) {
         <>
           <ConnectBtn label="🖥 RDP (browser)" onClick={() => openConsole(ip, vm.name, 'rdp', { provider: vm.provider, os: vm.os })} />
           <ConnectBtn label="⤓ RDP (direct .rdp)" onClick={() => downloadRdp(vm.id, vm.name)} />
+          {remoteAgent && (
+            <ConnectBtn label="👁 Remote support (main screen)" onClick={() => setRemote(true)} />
+          )}
         </>
-      ) : (
+      ) : isMac ? (
         <>
+          {/* macOS: graphical remote console over VNC (built-in Screen Sharing), plus a terminal. */}
+          <ConnectBtn label="🖥 Screen (VNC browser)" onClick={() => openConsole(ip, vm.name, 'vnc', { provider: vm.provider, os: vm.os })} />
           <ConnectBtn label="⌨ SSH (browser)" onClick={() => openConsole(ip, vm.name, 'ssh', { provider: vm.provider, os: vm.os })} />
           <ConnectBtn label="⧉ SSH (direct)" onClick={() => copySsh(ip)} />
         </>
+      ) : (
+        <>
+          {/* Linux: a terminal (SSH) and, when a VNC/X server is running, a graphical desktop over VNC. */}
+          <ConnectBtn label="⌨ SSH (browser)" onClick={() => openConsole(ip, vm.name, 'ssh', { provider: vm.provider, os: vm.os })} />
+          <ConnectBtn label="⧉ SSH (direct)" onClick={() => copySsh(ip)} />
+          <ConnectBtn label="🖥 Desktop (VNC browser)" onClick={() => openConsole(ip, vm.name, 'vnc', { provider: vm.provider, os: vm.os })} />
+        </>
+      )}
+      {isWin && !remoteAgent && (
+        <span className="text-[10px] text-muted">
+          Remote support (main monitor, with consent) needs the MCMF guest agent reporting on this host.
+        </span>
+      )}
+      {remote && remoteAgent && (
+        <RemoteSupportModal agentId={remoteAgent.id} targetName={vm.name} onClose={() => setRemote(false)} />
       )}
     </div>
   );

@@ -16,8 +16,8 @@ export class InventoryController {
   }
 
   @Get('vms')
-  vms() {
-    return this.service.listVms();
+  vms(@Req() req: any) {
+    return this.service.listVmsForUser(req.user?.sub, req.user?.role);
   }
 
   @Get('resources/:id')

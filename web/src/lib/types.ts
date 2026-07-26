@@ -739,6 +739,7 @@ export interface VmRow {
   privateIp: string | null;
   controllable: boolean;
   connect: VmConnect;
+  group?: string; // device group (from the watching monitor) — used for per-user scope + the group filter
 }
 
 export interface CommandCenterOverview {
@@ -827,6 +828,7 @@ export interface SettingsData {
     monitorIntervalSec: number; alertEvalSec: number; agentOfflineSec: number;
     agentRetentionDays: number; approvalExpiryDays: number; logTtlSettingDays: number;
     sessionTimeoutHours: number;
+    remoteRequireConsent: boolean; remoteConsentTimeoutSec: number;
   };
   connections: { provider: Provider; accounts: number; status: string }[];
   integrations: { id: string; name: string; kind: string; target: string; status: string }[];

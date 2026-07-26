@@ -9,7 +9,7 @@ import type { BoardPanel } from '@/lib/types';
 
 // Each tab is its own customizable board (independent saved layout per boardKey),
 // so the long single-scroll monitoring page becomes a few focused screens.
-type MonTab = 'overview' | 'trends' | 'telemetry' | 'netdevices' | 'health';
+type MonTab = 'overview' | 'trends' | 'uptime' | 'telemetry' | 'netdevices' | 'health';
 const TABS: { id: MonTab; label: string; icon: string; boardKey: string; seed: BoardPanel[] }[] = [
   {
     id: 'overview',
@@ -36,6 +36,18 @@ const TABS: { id: MonTab; label: string; icon: string; boardKey: string; seed: B
       { i: 'lat', kind: 'trend', title: 'Latency Trend', cfg: { metric: 'latency' }, x: 0, y: 10, w: 6, h: 5 },
       { i: 'jit', kind: 'trend', title: 'Jitter Trend', cfg: { metric: 'jitter' }, x: 6, y: 10, w: 6, h: 5 },
       { i: 'err', kind: 'trend', title: 'Error-Rate Trend', cfg: { metric: 'error' }, x: 0, y: 15, w: 6, h: 5 },
+    ],
+  },
+  {
+    // Uptime is its own screen rather than a tile on Overview: the SLA question ("was it up, for how
+    // long, and when was it off") is asked at reporting time and needs the whole width to answer.
+    id: 'uptime',
+    label: 'Uptime & SLA',
+    icon: '⏱',
+    boardKey: 'monitoring-uptime',
+    seed: [
+      { i: 'uptime-sla', kind: 'uptime-sla', title: 'Device Uptime & SLA', x: 0, y: 0, w: 12, h: 10 },
+      { i: 'uptime-summary', kind: 'uptime-summary', title: 'Fleet SLA Summary', x: 0, y: 10, w: 5, h: 8 },
     ],
   },
   {

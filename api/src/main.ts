@@ -93,7 +93,10 @@ async function bootstrap() {
     const { WebSocketServer } = require('ws');
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { AgentTunnelHub } = require('./modules/agent/agent-tunnel.hub');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { RemoteMediaHub } = require('./modules/remote/media.hub');
     const hub = app.get(AgentTunnelHub);
+    const media = app.get(RemoteMediaHub);
     const httpServer = app.getHttpServer();
     const guacUpgrade = httpServer.listeners('upgrade').slice();
     httpServer.removeAllListeners('upgrade');
@@ -107,16 +110,35 @@ async function bootstrap() {
         hub.attachAgentWs(session, ws);
       } catch { try { ws.close(); } catch { /* */ } }
     });
+    // Remote-support media relay (persistent transport replacing JPEG-per-POST). Two paths on the same
+    // noServer WSS: the target's agent dials /media/agent (agent key in the URL, like the console tunnel);
+    // the operator's browser dials /media/viewer and authenticates with a JWT sent as its FIRST message
+    // (never in the URL — a token in a query string would leak into logs).
+    const mediaWss = new WebSocketServer({ noServer: true });
+    mediaWss.on('connection', (ws: any, req: any) => {
+      try {
+        const u = new URL(req.url, 'http://x');
+        const session = u.searchParams.get('session') || '';
+        if (!session) { ws.close(); return; }
+        if (String(u.pathname) === '/api/remote/media/agent') {
+          void media.attachAgent(session, u.searchParams.get('k') || '', ws);
+        } else {
+          void media.attachViewer(session, ws);
+        }
+      } catch { try { ws.close(); } catch { /* */ } }
+    });
     httpServer.on('upgrade', (req: any, socket: any, head: any) => {
       const path = String(req.url || '').split('?')[0];
       if (path === '/api/agent/tunnel') {
         wss.handleUpgrade(req, socket, head, (ws: any) => wss.emit('connection', ws, req));
+      } else if (path === '/api/remote/media/agent' || path === '/api/remote/media/viewer') {
+        mediaWss.handleUpgrade(req, socket, head, (ws: any) => mediaWss.emit('connection', ws, req));
       } else {
         for (const l of guacUpgrade) (l as any).call(httpServer, req, socket, head);
       }
     });
     // eslint-disable-next-line no-console
-    console.log('Agent console tunnel attached at /api/agent/tunnel');
+    console.log('Agent console tunnel attached at /api/agent/tunnel; remote media relay at /api/remote/media/*');
   } catch (e) {
     // eslint-disable-next-line no-console
     console.warn(`Agent tunnel not started: ${String((e as Error)?.message ?? e)}`);

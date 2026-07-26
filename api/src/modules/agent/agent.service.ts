@@ -18,7 +18,7 @@ import { encryptJson, decryptJson } from '../../connectors/crypto';
  * on each ingest so an installed agent can self-update when it's older. BUMP THIS whenever the agent
  * scripts (mcmf-tray-agent.ps1 / mcmf-agent-linux.py / the installer) change.
  */
-export const AGENT_VERSION = '1.7.0';
+export const AGENT_VERSION = '1.20.14';
 
 /** Shared agent ingest key (stable, derived from the app key unless overridden). */
 function agentKey(): string {
@@ -98,17 +98,59 @@ function windowsInstallBody(key: string, mcmfIp: string, pullPort: number): stri
   return `
 $ErrorActionPreference='Stop'
 try {
-  # Clean upgrade — stop + remove ANY prior/legacy MCMF agent so only the outbound agent runs
-  # (no duplicates, no stale push agent pinning outbound=false). Idempotent: safe on a fresh box.
-  Get-ScheduledTask -TaskName 'MCMF*' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
-  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*mcmf-tray-agent*' -or $_.CommandLine -like '*mcmf-agent*' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
-  Unregister-ScheduledTask -TaskName 'MCMF Guest Agent' -Confirm:$false -ErrorAction SilentlyContinue
-  Unregister-ScheduledTask -TaskName 'MCMF Agent' -Confirm:$false -ErrorAction SilentlyContinue
   # Reuse the EXE installer's directory if present (it installs under "Program Files (x86)"), so a
   # self-update upgrades the SAME install in place instead of creating a second copy under "Program Files".
   $dir = if (Test-Path 'C:\\Program Files (x86)\\MCMF\\mcmf-tray-agent.ps1') { 'C:\\Program Files (x86)\\MCMF' } else { 'C:\\Program Files\\MCMF' }
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $agent = Join-Path $dir 'mcmf-tray-agent.ps1'
+
+  # ---- UPDATE vs FRESH INSTALL ------------------------------------------------------------------
+  # An UPDATE must never uninstall anything. If this agent is already installed here, the upgrade is
+  # just: overwrite the script, re-register the two tasks in place with -Force, restart the process.
+  # Nothing is unregistered, no service is deleted, no directory is touched -- so a failure part-way
+  # through still leaves a machine with a registered, working agent.
+  #
+  # Only a FRESH install cleans up, and even then only what is demonstrably a DIFFERENT agent: a task
+  # under an old name, a legacy service, or a copy in the other Program Files directory. That is the
+  # case where leaving the old one behind would give you two agents fighting over the same screen.
+  $isUpdate = (Test-Path $agent) -and ($null -ne (Get-ScheduledTask -TaskName 'MCMF Endpoint Agent (Service)' -ErrorAction SilentlyContinue))
+  $removed = @()
+  if ($isUpdate) {
+    Write-Output 'MCMF_MODE=update (upgrading in place - nothing removed)'
+  } else {
+    Write-Output 'MCMF_MODE=install'
+    $keepTasks = @('MCMF Endpoint Agent', 'MCMF Endpoint Agent (Service)')
+    # Scheduled tasks under an OLD name. The names have changed across versions ('MCMF Agent',
+    # 'MCMF Guest Agent', ...) and an unknown old name is exactly the one that would survive and keep
+    # relaunching a second agent. The two current names are never touched.
+    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'MCMF*' -and $keepTasks -notcontains $_.TaskName })) {
+      try { Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue } catch {}
+      try { Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue; $removed += ('task:' + $t.TaskName) } catch {}
+    }
+    # Any legacy Windows SERVICE. The current agent never installs one, so anything here is a leftover.
+    foreach ($svc in @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'MCMF*' -or $_.DisplayName -like 'MCMF*' })) {
+      try { Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue } catch {}
+      try { & sc.exe delete $svc.Name | Out-Null; $removed += ('service:' + $svc.Name) } catch {}
+    }
+    # A copy of the agent in the OTHER install directory -- never $dir, so we cannot delete our own.
+    foreach ($old in @('C:\\Program Files\\MCMF', 'C:\\Program Files (x86)\\MCMF')) {
+      if ($old -eq $dir) { continue }
+      $oldAgent = Join-Path $old 'mcmf-tray-agent.ps1'
+      if (Test-Path $oldAgent) { try { Remove-Item -Path $oldAgent -Force -ErrorAction SilentlyContinue; $removed += ('file:' + $oldAgent) } catch {} }
+      try { if ((Test-Path $old) -and -not (Get-ChildItem -Path $old -Force -ErrorAction SilentlyContinue)) { Remove-Item -Path $old -Force -ErrorAction SilentlyContinue } } catch {}
+    }
+    if ($removed.Count -gt 0) { Write-Output ('MCMF_REMOVED_OLD=' + ($removed -join ';')) } else { Write-Output 'MCMF_REMOVED_OLD=none' }
+  }
+
+  # Which running agent processes to restart depends on whether this is an update or a fresh install,
+  # and it is done AFTER the new script is written (below), so nothing relaunches the old code in the gap.
+  #   · UPDATE: restart ONLY the SYSTEM service, so it reloads the new script. The tray is LEFT RUNNING
+  #     -- killing it is what made the icon vanish on every update, and the tray's job (the consent
+  #     prompt) is unaffected by keeping the old UI until the next manual launch or reboot. The service
+  #     is what carries the fixed behaviour, so restarting only it is enough.
+  #   · INSTALL: the tasks are (re)registered fresh below and started from scratch.
+  # Never this process: during a self-update the installer is a child of the old service, and killing
+  # our own tree would abort the upgrade halfway.
   [System.IO.File]::WriteAllText($agent, [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps1b64}')))
   $cfg = Join-Path $env:ProgramData 'MCMF'; New-Item -ItemType Directory -Force -Path $cfg | Out-Null
   try { & icacls $cfg /grant '*S-1-5-32-545:(OI)(CI)M' /T | Out-Null } catch {}
@@ -128,6 +170,12 @@ try {
   } catch {}
   # Pure outbound — no inbound listener, so remove any legacy MCMF firewall rule and open NO port.
   try { & netsh advfirewall firewall delete rule name='MCMF Agent ${pullPort}' | Out-Null } catch {}
+  # On an UPDATE the tasks and shortcuts already exist and already point at this same script, so they
+  # are left completely alone. Re-registering them with -Force works, but -Force deletes and recreates
+  # the task, and for the moment in between the machine has no registered agent -- which is both a real
+  # risk and exactly what "it removes the agent and installs it again" looks like from the console.
+  # An in-place update is: overwrite the .ps1, restart the process. Nothing else.
+  if (-not $isUpdate) {
   $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $agent + '" -Service')
   $prn = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -RunLevel Highest
   $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999 -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -135,12 +183,14 @@ try {
   $tact = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $agent + '"')
   $tprn = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest
   Register-ScheduledTask -TaskName 'MCMF Endpoint Agent' -Action $tact -Trigger (New-ScheduledTaskTrigger -AtLogon) -Principal $tprn -Force | Out-Null
-  # All-users Start-menu + Desktop shortcuts so the agent has an app icon you can launch (e.g. after Exit).
-  # Overwriting same-named .lnk keeps it idempotent — no duplicate icons on re-install.
+  # All-users START-MENU shortcut only, so the agent has an app icon you can launch (e.g. after Exit).
+  # Deliberately NO Desktop shortcut — it clutters every user's desktop. Overwriting the same-named .lnk
+  # keeps it idempotent (no duplicate icons on re-install), and we also remove any Desktop shortcut left
+  # by an earlier agent version so an update cleans it up.
   try {
     $ws = New-Object -ComObject WScript.Shell
     $psExe = (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-    foreach ($loc in @([Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('CommonPrograms'))) {
+    foreach ($loc in @([Environment]::GetFolderPath('CommonPrograms'))) {
       try {
         $lnk = $ws.CreateShortcut((Join-Path $loc 'MCMF Endpoint Agent.lnk'))
         $lnk.TargetPath = $psExe
@@ -151,14 +201,42 @@ try {
         $lnk.Save()
       } catch {}
     }
+    # Clean up desktop shortcuts dropped by older installers (all-users desktop + the current user's).
+    foreach ($dloc in @([Environment]::GetFolderPath('CommonDesktopDirectory'), [Environment]::GetFolderPath('Desktop'))) {
+      try { $old = (Join-Path $dloc 'MCMF Endpoint Agent.lnk'); if (Test-Path $old) { Remove-Item $old -Force -ErrorAction SilentlyContinue } } catch {}
+    }
   } catch {}
-  Start-ScheduledTask -TaskName 'MCMF Endpoint Agent (Service)'
-  # Relaunch the tray immediately (a self-update killed the old one) — runs the logon task now in the
-  # interactive session, so the icon comes back without waiting for the next logon. Harmless if headless.
-  try { Start-ScheduledTask -TaskName 'MCMF Endpoint Agent' -ErrorAction SilentlyContinue } catch {}
+  }
+  if ($isUpdate) {
+    # Restart the service process so it picks up the new script. Stop the service's own process (not the
+    # task), then let the scheduled task's restart-on-exit bring it back on the new code -- and kick it
+    # explicitly in case restart is slow.
+    foreach ($proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*mcmf-tray-agent*' -and $_.CommandLine -like '*-Service*' })) {
+      if ($proc.ProcessId -eq $PID) { continue }
+      try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    Start-Sleep -Seconds 1
+    try { Start-ScheduledTask -TaskName 'MCMF Endpoint Agent (Service)' -ErrorAction SilentlyContinue } catch {}
+    # ALSO reload the TRAY so its Settings / About UI reflects the new version WITHOUT anyone having to
+    # exit + relaunch it by hand (not feasible across many VMs). The tray caches the script in memory at
+    # launch, so a self-update alone leaves the old UI on screen. This runs from the freshly-downloaded
+    # bootstrap (server's current version), so it works even when updating FROM an old agent that had no
+    # self-reload. Kill the interactive tray (not the service / console helper / this updater), then let
+    # its logon scheduled task relaunch a fresh tray into the active user session on the new code.
+    foreach ($proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*mcmf-tray-agent*' -and $_.CommandLine -notlike '*-Service*' -and $_.CommandLine -notlike '*-Console*' -and $_.CommandLine -notlike '*-Settings*' })) {
+      if ($proc.ProcessId -eq $PID) { continue }
+      try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    Start-Sleep -Milliseconds 800
+    try { Start-ScheduledTask -TaskName 'MCMF Endpoint Agent' -ErrorAction SilentlyContinue } catch {}
+  } else {
+    # Fresh install: start the service, and launch the tray now so its icon appears without a re-logon.
+    Start-ScheduledTask -TaskName 'MCMF Endpoint Agent (Service)'
+    try { Start-ScheduledTask -TaskName 'MCMF Endpoint Agent' -ErrorAction SilentlyContinue } catch {}
+  }
   Start-Sleep -Seconds 2
   $st = (Get-ScheduledTask -TaskName 'MCMF Endpoint Agent (Service)').State
-  Write-Output ('MCMF_WIN_INSTALL=ok;state=' + $st)
+  Write-Output ('MCMF_WIN_INSTALL=ok;mode=' + $(if ($isUpdate) { 'in-place-update' } else { 'install' }) + ';state=' + $st)
 } catch { Write-Output ('MCMF_WIN_ERR=' + $_.Exception.Message) }
 `;
 }
@@ -281,17 +359,19 @@ export class AgentService implements OnModuleInit {
   }
 
   /** Try each IP until the TCP agent answers — the exe/PowerShell agent pull path. */
-  private async pullTcpFailover(hosts: string[], port: number, key: string, os: string) {
+  private async pullTcpFailover(hosts: string[], port: number, key: string, os: string, known?: { hostname?: string | null; machineId?: string | null }) {
     let lastErr: unknown;
     for (const h of hosts.filter(Boolean)) {
-      try { await this.pullTcp(h, port, key, os); return; }
+      try { await this.pullTcp(h, port, key, os, known); return; }
       catch (e) { lastErr = e; }
     }
     throw lastErr ?? new Error('no reachable IP');
   }
 
-  /** Raw-TCP pull (no HTTP): connect, send "AUTH <key>", read one JSON line of telemetry, ingest it. */
-  private pullTcp(host: string, port: number, key: string, os: string): Promise<void> {
+  /** Raw-TCP pull (no HTTP): connect, send "AUTH <key>", read one JSON line of telemetry, ingest it.
+   *  `known` = refresh an ALREADY-ENROLLED row (from pullNow) by its real identity so a pull of a
+   *  push agent updates that row instead of forking a second IP-keyed one. */
+  private pullTcp(host: string, port: number, key: string, os: string, known?: { hostname?: string | null; machineId?: string | null }): Promise<void> {
     return new Promise((resolve, reject) => {
       const sock = net.connect({ host, port });
       let buf = '';
@@ -304,13 +384,17 @@ export class AgentService implements OnModuleInit {
         let j: any;
         try { j = JSON.parse(line); } catch { return reject(new Error('agent returned no telemetry')); }
         if (j?.error) return reject(new Error(String(j.error)));
-        // IMPORTANT: key the agent row by the enroll IP we connected to (hostname: host), NOT the
-        // agent's self-reported hostname — otherwise ingest() can't match the enrolled row and
-        // creates a duplicate, leaving the IP-keyed row (which the UI shows) forever stale.
-        // The real hostname is kept in `name` for display. (SSH pull does the same: hostname=IP.)
+        // For a NEW pull-enroll we key the row by the IP we connected to (hostname: host), because that
+        // is the only stable handle we have. But when REFRESHING an already-enrolled row (`known`, from
+        // pullNow), key it by that row's real identity (hostname + machineId) — else pulling/Testing a
+        // PUSH agent forks a second IP-keyed "push (legacy)" row for the same machine. The real hostname
+        // is always kept in `name` for display.
         const ipList = Array.isArray(j?.ips) && j.ips.length ? [host, ...j.ips.map(String)] : [host];
         this.ingest({
-          name: j?.hostname ?? host, hostname: host, os: j?.os ?? os, ips: [...new Set(ipList)],
+          name: j?.hostname ?? host,
+          hostname: known?.hostname ?? host,
+          machineId: known?.machineId ?? j?.machineId,
+          os: j?.os ?? os, ips: [...new Set(ipList)],
           metrics: { cpuPct: Number(j?.cpuPct), memPct: Number(j?.memPct), diskPct: Number(j?.diskPct), netMbps: Number(j?.netMbps), diskIoKbps: Number(j?.diskIoKbps) },
           services: Array.isArray(j?.services) ? j.services : [],
           events: Array.isArray(j?.events) ? j.events : [],
@@ -373,7 +457,8 @@ export class AgentService implements OnModuleInit {
       // (push agents are often stored with port=22 from enrollment).
       const port = t.port && t.port !== 22 ? t.port : 9182;
       try {
-        await this.pullTcpFailover(hosts, port, key, t.os ?? 'windows');
+        // Refresh THIS row by its own identity so testing a push agent never forks an IP-keyed twin.
+        await this.pullTcpFailover(hosts, port, key, t.os ?? 'windows', { hostname: t.hostname, machineId: t.machineId });
         return { ok: true, reachable: true, message: 'Reached the agent and pulled fresh telemetry ✓', agent: await this.prisma.agent.findUnique({ where: { id } }) };
       } catch (e) {
         const why = String((e as Error)?.message ?? e).slice(0, 160);
@@ -580,9 +665,39 @@ export class AgentService implements OnModuleInit {
     const agent = existing
       ? await this.prisma.agent.update({ where: { id: existing.id }, data })
       : await this.prisma.agent.create({ data });
-    // Clean up any pre-existing duplicates for this machine (older rows by the same machineId/hostname).
-    if (machineId) {
-      await this.prisma.agent.deleteMany({ where: { id: { not: agent.id }, OR: [{ machineId }, { hostname, machineId: null }] } }).catch(() => undefined);
+    // Remove any older row that is really THIS machine, so a re-install or an upgrade never leaves a
+    // second agent behind. A leftover row is not cosmetic: it never checks in again, so it shows up
+    // forever as a permanently-down device, drags the fleet SLA numbers down, and — as happened here —
+    // can be picked as the target of a command that will never be delivered.
+    //
+    // Three ways the same machine can appear under a different key:
+    //   · same machineId          — ordinary re-install;
+    //   · same hostname, no id    — agent too old to report one at all;
+    //   · same hostname, id == hostname — older agents fell back to the HOSTNAME when they could not
+    //     read MachineGuid. That placeholder is not null, so an id-based match skips it and the row
+    //     survives every upgrade.
+    //   · same machine registered under its IP — a raw-TCP / SSH pull (or a discovery probe) ingests with
+    //     hostname = the IP and no machineId, so the push row (hostname = the real name) never matched it
+    //     and a permanent "IP twin" survived. Match any machineId-less row whose hostname is one of THIS
+    //     machine's current IPs, or that merely shares this machine's display name, so it gets cleaned up.
+    const staleSameHost: any[] = [{ hostname, machineId: null }, { hostname, machineId: hostname }];
+    if (ips.length) staleSameHost.push({ hostname: { in: ips }, machineId: null });
+    staleSameHost.push({ name: data.name, machineId: null, hostname: { not: hostname } });
+    const stale = await this.prisma.agent.findMany({
+      where: { id: { not: agent.id }, OR: machineId ? [{ machineId }, ...staleSameHost] : staleSameHost },
+      select: { id: true, name: true, version: true, machineId: true },
+    }).catch(() => [] as any[]);
+    if (stale.length) {
+      await this.prisma.agent.deleteMany({ where: { id: { in: stale.map((a) => a.id) } } }).catch(() => undefined);
+      const detail = stale.map((a) => `${a.name} (v${a.version ?? '?'}, id ${a.machineId ?? 'none'})`).join(', ');
+      this.log.log(`removed ${stale.length} superseded agent row(s) for ${hostname}: ${detail}`);
+      await this.prisma.eventLog.create({
+        data: {
+          type: 'system', severity: 'info',
+          title: `Removed ${stale.length} superseded agent registration(s) for ${hostname}`.slice(0, 500),
+          detail: detail.slice(0, 1000),
+        },
+      }).catch(() => undefined);
     }
 
     // Issue a per-agent token on first check-in (rotatable/revocable). The agent adopts it and presents
@@ -733,6 +848,22 @@ export class AgentService implements OnModuleInit {
     await this.prisma.agent.update({ where: { id }, data: { active: false } }).catch(() => undefined);
     await this.prisma.agent.delete({ where: { id } }).catch(() => undefined);
     return { ok: true };
+  }
+
+  /**
+   * The agent list a given user is allowed to see. A user is scoped to their assigned device groups
+   * (`user.monitorGroups`): non-empty means they see ONLY agents in those groups; empty means all
+   * (backward-compatible). Admins always see everything. The agent's group is the mirrored monitor's
+   * group, the same scope Network Devices / IP-Host Monitor use — so one assignment covers all of them.
+   */
+  async listForUser(userId?: string, role?: string) {
+    const all = await this.list();
+    if (role === 'admin' || !userId) return all;
+    const u = await this.prisma.user.findUnique({ where: { id: userId }, select: { monitorGroups: true } });
+    const groups = Array.isArray(u?.monitorGroups) ? (u!.monitorGroups as string[]).filter(Boolean) : [];
+    if (!groups.length) return all;
+    const set = new Set(groups);
+    return all.filter((a) => set.has(a.group));
   }
 
   async list() {
@@ -1069,6 +1200,19 @@ export class AgentService implements OnModuleInit {
     if (!['run', 'power', 'config', 'update', 'uninstall'].includes(kind)) throw new BadRequestException('kind must be run | power | config | update | uninstall');
     if (kind === 'run' && !String(body?.payload?.command ?? '').trim()) throw new BadRequestException('run requires payload.command');
     if (kind === 'power' && !['restart', 'shutdown'].includes(String(body?.payload?.action ?? ''))) throw new BadRequestException('power requires payload.action = restart | shutdown');
+    // Uninstall is the one command that undoes the install itself, so it needs the caller to name the
+    // machine. Everything else here is recoverable; this one leaves a host unmanaged, and an uninstall
+    // aimed at the wrong agent id would be silent and irreversible. The agent re-checks the same thing
+    // before acting, so neither side can be talked into it alone.
+    if (kind === 'uninstall') {
+      const confirmHost = String(body?.payload?.confirmHost ?? '').trim();
+      const expected = (agent.hostname || agent.name || '').trim();
+      if (!confirmHost || confirmHost.toLowerCase() !== expected.toLowerCase()) {
+        throw new BadRequestException(
+          `Uninstalling removes MCMF management from this machine. To confirm, send payload.confirmHost = "${expected}".`,
+        );
+      }
+    }
     const cmd = await this.prisma.agentCommand.create({ data: { agentId, kind, payload: (body?.payload ?? {}) as any, createdById: userId ?? '' } });
     return { ok: true, commandId: cmd.id, status: cmd.status };
   }
@@ -1081,7 +1225,10 @@ export class AgentService implements OnModuleInit {
   async shutdownAgent(userId: string, agentId: string) {
     const agent = await this.prisma.agent.findUnique({ where: { id: agentId } });
     if (!agent) throw new NotFoundException('agent not found');
-    await this.prisma.agentCommand.create({ data: { agentId, kind: 'uninstall', payload: {} as any, createdById: userId ?? '' } });
+    // The Shut-down button IS the explicit intent, so it carries the confirmation the agent now
+    // requires -- the host names itself. A random queued uninstall cannot; this one is deliberate.
+    const confirmHost = agent.hostname || agent.name || '';
+    await this.prisma.agentCommand.create({ data: { agentId, kind: 'uninstall', payload: { confirmHost } as any, createdById: userId ?? '' } });
     await this.prisma.agent.update({ where: { id: agentId }, data: { active: false } }).catch(() => undefined);
     return { ok: true, message: `Shutdown sent to ${agent.name}. It will uninstall itself (remove its service + files) on its next check-in, then disappear from the list.` };
   }

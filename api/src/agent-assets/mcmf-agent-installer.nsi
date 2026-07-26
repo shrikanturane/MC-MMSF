@@ -70,9 +70,10 @@ Section "Install"
   FileClose $2
   nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-logon-task.ps1"'
 
-  ; Start-Menu + Desktop shortcuts so the agent has an app icon you can launch (e.g. after Exit).
+  ; Start-Menu shortcut only so the agent has an app icon you can launch (e.g. after Exit).
+  ; No Desktop shortcut by design — it clutters the desktop; remove any left by an older installer.
   CreateShortcut "$SMPROGRAMS\${APPNAME}.lnk" "wscript.exe" '"$INSTDIR\launch.vbs"'
-  CreateShortcut "$DESKTOP\${APPNAME}.lnk" "wscript.exe" '"$INSTDIR\launch.vbs"'
+  Delete "$DESKTOP\${APPNAME}.lnk"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "${REGKEY}" "DisplayName" "${APPNAME}"

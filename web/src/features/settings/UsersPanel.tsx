@@ -247,14 +247,14 @@ function UserModal({ user, roles, onClose }: { user: User | null; roles: RoleSpe
           />
 
           <label className="col-span-2 block">
-            <span className="mb-1.5 block text-2xs font-medium uppercase tracking-wide text-muted">Monitor Groups <span className="normal-case text-muted-light">(comma-separated · blank = all)</span></span>
+            <span className="mb-1.5 block text-2xs font-medium uppercase tracking-wide text-muted">Device Groups (scope) <span className="normal-case text-muted-light">(comma-separated · blank = all)</span></span>
             <input
               value={f.monitorGroups}
               onChange={(e) => setF({ ...f, monitorGroups: e.target.value })}
               placeholder="e.g. datacenter-a, cloud-prod"
               className="w-full rounded-lg border border-border bg-bg px-3 py-2 text-sm text-white placeholder:text-muted focus:border-brand focus:outline-none"
             />
-            <span className="mt-1 block text-2xs text-muted">Restricts which IP/Host monitors this user can see. For a monitoring-only user, set role <b className="text-white">Viewer</b>, list their group(s) here, and hide other modules under <b className="text-white">Workspace → Modules</b>.</span>
+            <span className="mt-1 block text-2xs text-muted">Scopes what this user can see to these group(s): IP/Host monitors, network devices, <b className="text-white">guest agents</b>, and <b className="text-white">VMs</b> in those groups — nothing else. Blank = all. Admins always see everything. For a scoped user, set role <b className="text-white">Viewer</b> or <b className="text-white">Operator</b> and list their group(s) here.</span>
           </label>
 
           {/* Admin-set MFA requirement — user is forced to enrol on next sign-in. */}

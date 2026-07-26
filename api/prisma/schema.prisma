@@ -333,6 +333,56 @@ model AnomalyDetection {
   @@index([resourceId, detectorType, metric, detectedAt])
 }
 
+// Attended remote-support session (Windows main-console). One row per request — including refused and
+// expired ones, because "who asked to watch this desktop and were they told no" is the audit question.
+// consent='auto-accepted' means the prompt was shown but NOT answered; it is deliberately distinct from
+// 'accepted' so a reviewer can never mistake a timeout for a human agreeing.
+model RemoteSession {
+  id             String    @id @default(cuid())
+  agentId        String
+  targetName     String    @default("") // hostname shown to the operator
+  operatorId     String    @default("")
+  operatorEmail  String    @default("")
+  reason         String    @default("") // operator-stated support reason (audit)
+  status         String    @default("requested") // requested | awaiting-consent | active | ended | declined | expired | failed
+  consent        String    @default("pending") // pending | accepted | declined | auto-accepted | not-required
+  autoAccepted   Boolean   @default(false)
+  consentUser    String? // the interactive user who was asked (null = headless console)
+  requestedAt    DateTime  @default(now())
+  promptedAt     DateTime? // when the consent dialog went up on the target
+  startedAt      DateTime?
+  endedAt        DateTime?
+  durationSec    Int?
+  endReason      String    @default("")
+  frames         Int       @default(0)
+  lastFrameAt    DateTime? // last frame accepted - drives the idle timeout that closes abandoned sessions
+  captureSource  String    @default("") // console = SYSTEM helper (sees the logon/lock/UAC screens) | tray = interactive fallback
+  // Snapshotted at request time so a mid-session settings change can't flip a live session, and so the
+  // no-answer timeout can be OS-aware: server → auto-approve, Win10/11 client → cancel.
+  consentRequired Boolean  @default(false) // did this session require the user's Accept? (snapshot of the global policy)
+  targetOsVersion String   @default("") // the target's reported OS caption (e.g. "Windows Server 2022" / "Windows 11") — /server/i decides the timeout branch
+  // Driving the target's keyboard/mouse is a SEPARATE power from watching it, so it is a separate flag,
+  // off until an operator turns it on and re-checked on every batch of input.
+  inputEnabled   Boolean   @default(false)
+  inputEvents    Int       @default(0) // keystrokes/clicks injected — the audit answer to "what did they do"
+  // Two-way audio (admin hears the target's system+mic; admin talks back) is a SEPARATE power again,
+  // off until an operator turns it on, re-checked on every frame reply. Nothing is captured or played
+  // on the target while this is false — same opt-in discipline as inputEnabled.
+  audioEnabled   Boolean   @default(false)
+  recording      Boolean   @default(true) // operator can stop/start recording mid-session (audited both ways)
+  framesSkipped  Int       @default(0) // grabs the target suppressed because the screen had not changed
+  quality        String    @default("medium") // remote-console quality profile: min | medium | good | high
+  bytesReceived  BigInt    @default(0) // total frame bytes ingested — powers the live bandwidth readout
+  // H.264 artefacts, retention-capped (never raw frames on the app disk). A session is segmented into
+  // fixed-size parts, so recordingPath holds the FIRST part and recordingParts says how many exist.
+  recordingPath  String    @default("")
+  recordingBytes Int       @default(0) // total across all parts
+  recordingParts Int       @default(0)
+
+  @@index([agentId, requestedAt])
+  @@index([status])
+}
+
 // Layer 12 (Continuous Feedback & Optimisation): a rule-derived proposal to change the control plane —
 // tighten a Policy, add an AlertRule, or add an AutomationWorkflow. Every row is derived from real
 // anomaly/violation/rule data at generate() time; apply() performs the write and stamps who/when.
@@ -457,6 +507,49 @@ model Monitor {
   neighbors     Json      @default("[]") // connected devices: [{ mac, ip?, ifName? }]
   snmpState     Json      @default("{}") // prev octet counters + if-status for deltas/transitions
   createdAt     DateTime  @default(now())
+}
+
+// One up/down TRANSITION for a device. Transitions, not samples: a 60s sampler over a few hundred
+// devices writes half a million rows a month and still cannot say when a host went down, only which
+// minute we noticed. Two rows per outage answer every SLA question (hours up per day, when it was off,
+// availability, error budget) and stay cheap to keep for years.
+model DeviceUptimeEvent {
+  id         String   @id @default(cuid())
+  deviceKey  String // "<type>:<id>" — stable across renames
+  deviceType String // agent | monitor | resource
+  deviceName String   @default("")
+  deviceGroup String  @default("") // monitor group / provider — how SLA reports are sliced
+  up         Boolean
+  at         DateTime @default(now())
+  detail     String   @default("") // why we concluded this (e.g. "no heartbeat for 7m")
+
+  @@index([deviceKey, at])
+  @@index([at])
+}
+
+// The per-DAY uptime record for a device: how many hours it was on, how long it was off, and when.
+//
+// Derived from DeviceUptimeEvent rather than measured separately — transitions stay the single source
+// of truth, and a day row is only ever recomputed from them, never edited. It exists so a day's record
+// survives beyond the transition history, and so "hours up on 14 July" is one indexed read instead of
+// a scan. Today's row is rewritten as the day goes on; past days settle and stop changing.
+model DeviceUptimeDay {
+  id          String   @id @default(cuid())
+  deviceKey   String
+  date        String // YYYY-MM-DD in the report timezone (not UTC — an operator asks about their day)
+  deviceType  String   @default("")
+  deviceName  String   @default("")
+  deviceGroup String   @default("")
+  upSec       Int      @default(0)
+  downSec     Int      @default(0)
+  unknownSec  Int      @default(0)
+  upHours     Float    @default(0)
+  availabilityPct Float? // null = nothing observed that day
+  outages     Json     @default("[]") // [{from,to,seconds,ongoing}] — the "off at" times
+  computedAt  DateTime @default(now())
+
+  @@unique([deviceKey, date])
+  @@index([date])
 }
 
 // A guest agent installed on a VM/host, reporting telemetry + events.
@@ -604,6 +697,8 @@ model OrgSettings {
   approvalExpiryDays Int   @default(7)   // a pending approval request auto-expires after this
   logTtlSettingDays  Int   @default(30)  // ClickHouse log store TTL (applied on log-store (re)init)
   sessionTimeoutHours Int  @default(12)  // idle/session lifetime for a normal sign-in (not "remember me")
+  remoteRequireConsent Boolean @default(false) // remote console: ON = the user at the PC must Accept before it starts (servers auto-approve after remoteConsentTimeoutSec; Win10/11 clients are cancelled). OFF = connect directly, no prompt.
+  remoteConsentTimeoutSec Int @default(180) // how long the Accept prompt waits before the OS-differentiated timeout policy applies (3 min)
   clusterCname String   @default("") // HA cluster CNAME / floating VIP that agents & clients target for failover
   platformDomain  String @default("") // this server's public domain (one per deployment); blank = access by IP
   platformTlsMode String @default("") // how HTTPS is provided for platformDomain: '' | letsencrypt | upload | upstream
@@ -1000,6 +1095,11 @@ model ReplicationSet {
   enabled       Boolean   @default(true)
   status        String    @default("idle") // idle | running | healthy | lagging | failed | paused
   state         String    @default("primary-active") // primary-active | failed-over | tertiary-active
+  // Carry the live secondary's writes back to the primary on the normal interval WHILE failed over.
+  // Off by default on purpose: promote(mode='simulated') also parks a set in 'failed-over' for a DRILL,
+  // where the primary may still be live — automatic reverse copy would then overwrite it.
+  reverseReplication Boolean @default(false)
+  lastReverseOkAt DateTime? // last successful secondary -> primary copy (fail-back RPO baseline)
   lastRunAt     DateTime?
   lastOkAt      DateTime?
   lastError     String    @default("")
@@ -1027,6 +1127,10 @@ model FailoverTrial {
   rpoSeconds         Int?           // derived from the set's lastOkAt at trigger time (null = unknown)
   rtoSeconds         Int?           // verifiedAt - triggeredAt (null = never verified)
   outcome            String         @default("failed") // success | partial | failed
+  // Fail-back reconciliation: did the secondary's writes actually get carried back before promoting?
+  // null = not applicable (failover, or DRBD which reconciles itself); true/false = attempted, outcome.
+  reconciled         Boolean?
+  reconcileDetail    String         @default("") // what the s2p sync reported, or why it was skipped
   verificationDetail String         @default("") // human-readable verification summary
   drbdOutput         String         @default("") // raw drbdadm status captured during verification
 

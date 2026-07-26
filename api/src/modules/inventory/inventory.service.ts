@@ -89,10 +89,23 @@ export class InventoryService {
         include: { cloudAccount: { select: { name: true } } },
         orderBy: [{ provider: 'asc' }, { name: 'asc' }],
       }),
-      this.prisma.monitor.findMany({ where: { enabled: true }, select: { target: true, altTargets: true, status: true } }),
+      this.prisma.monitor.findMany({ where: { enabled: true }, select: { name: true, target: true, altTargets: true, status: true, group: true } }),
     ]);
     // Live reachability keyed by IP (monitors re-checked every 60s) — the truest up/down for hosts.
     const monByIp = buildMonByIp(monitors);
+    // A VM's device GROUP is that of the monitor watching it (matched by IP, then by name) — the same
+    // group scope agents/monitors use, so a per-user assignment covers VMs too. Unmatched => 'default'.
+    const groupByIp = new Map<string, string>();
+    const groupByName = new Map<string, string>();
+    for (const m of monitors) {
+      const g = m.group || 'default';
+      for (const t of [m.target, ...String(m.altTargets ?? '').split(',')].map((s) => s.trim()).filter(Boolean)) {
+        if (!groupByIp.has(t)) groupByIp.set(t, g);
+      }
+      if (m.name && !groupByName.has(m.name)) groupByName.set(m.name, g);
+    }
+    const groupFor = (name: string, pub: string | null, priv: string | null): string =>
+      (pub && groupByIp.get(pub)) || (priv && groupByIp.get(priv)) || groupByName.get(name) || 'default';
 
     // Collapse duplicate host identities (same machine enrolled by IP + by hostname + secondary IPs)
     // into one row — shared platform-wide. Cloud VMs are untouched. See common/host-identity.ts.
@@ -129,6 +142,7 @@ export class InventoryService {
         region: r.region,
         status,
         os,
+        group: groupFor(r.name, publicIp, privateIp),
         size: isDocker ? (p.image ?? null) : (p.size ?? p.instanceType ?? p.machineType ?? p.os ?? null),
         cpuPct: r.cpuPct,
         publicIp,
@@ -143,6 +157,21 @@ export class InventoryService {
         },
       };
     });
+  }
+
+  /**
+   * The VM list a given user is allowed to see — scoped to their assigned device groups
+   * (`user.monitorGroups`), the same rule as agents/monitors. Non-empty => only those groups;
+   * empty => all (backward-compatible). Admins always see everything.
+   */
+  async listVmsForUser(userId?: string, role?: string) {
+    const all = await this.listVms();
+    if (role === 'admin' || !userId) return all;
+    const u = await this.prisma.user.findUnique({ where: { id: userId }, select: { monitorGroups: true } });
+    const groups = Array.isArray(u?.monitorGroups) ? (u!.monitorGroups as string[]).filter(Boolean) : [];
+    if (!groups.length) return all;
+    const set = new Set(groups);
+    return all.filter((v) => set.has(v.group));
   }
 
   /** Power action (start/stop/reboot) on a cloud VM. */

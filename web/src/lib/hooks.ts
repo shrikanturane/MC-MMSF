@@ -458,6 +458,64 @@ export const useGenerateOptimization = () => useOptimizationMutation(() => apiPo
 export const useApplyOptimization = () => useOptimizationMutation((id: string) => apiPost(`/optimization/${id}/apply`, {}));
 export const useDismissOptimization = () => useOptimizationMutation((id: string) => apiPost(`/optimization/${id}/dismiss`, {}));
 
+// ── Attended remote support (Windows main console) ────────────────────────
+export interface RemoteSession {
+  id: string; agentId: string; targetName: string; operatorEmail: string; reason: string;
+  status: 'requested' | 'awaiting-consent' | 'active' | 'ended' | 'declined' | 'expired' | 'failed';
+  consent: 'pending' | 'accepted' | 'declined' | 'auto-accepted' | 'not-required';
+  autoAccepted: boolean; consentUser: string | null; consentSecondsLeft: number | null; mayStream: boolean;
+  /** Target is a Windows Server (auto-approves on the accept timeout) vs a Win 10/11 client (cancelled). */
+  targetIsServer?: boolean;
+  requestedAt: string; startedAt: string | null; endedAt: string | null; durationSec: number | null;
+  endReason: string; frames: number;
+  captureSource?: string; recordingBytes?: number; recordingPath?: string; recordingParts?: number;
+  /** Driving the target's keyboard/mouse is a separate power from watching it, so it is a separate flag. */
+  inputEnabled?: boolean; inputEvents?: number;
+  /** Two-way audio (hear the target's system+mic, talk back) is a separate power again, off until opted in. */
+  audioEnabled?: boolean;
+  /** Recording can be stopped and restarted mid-session; both are audited. */
+  recording?: boolean;
+  /** Frames the target never sent because the screen had not changed, and what share that was. */
+  framesSkipped?: number; motionSavingsPct?: number;
+  /** Console quality mode and live throughput. */
+  quality?: '144p' | '240p' | '360p' | '480p' | '720p' | '1080p';
+  bytesReceived?: number; bandwidthKbps?: number;
+}
+export const useRemoteSessions = (agentId?: string) =>
+  useQuery({
+    queryKey: ['remote-sessions', agentId ?? 'all'],
+    queryFn: () => apiGet<RemoteSession[]>(`/remote/sessions${agentId ? `?agentId=${agentId}` : ''}`),
+    refetchInterval: 5000,
+  });
+/** Poll one session hard while it is live — the consent countdown and status must feel immediate. */
+export const useRemoteSession = (id: string | null) =>
+  useQuery({
+    queryKey: ['remote-session', id],
+    queryFn: () => apiGet<RemoteSession>(`/remote/sessions/${id}`),
+    enabled: !!id,
+    refetchInterval: 1000,
+  });
+const useRemoteMutation = <T,>(fn: (v: T) => Promise<unknown>) => {
+  const qc = useQueryClient();
+  return useMutation({ mutationFn: fn, onSuccess: () => { qc.invalidateQueries({ queryKey: ['remote-sessions'] }); qc.invalidateQueries({ queryKey: ['remote-session'] }); } });
+};
+/** Start a remote session. Non-admin operators must include `twoFactorCode`; the server replies
+ *  `{ twoFactorRequired: true }` (not a session) until a valid code is supplied. Admins connect directly. */
+export const useRequestRemote = () => useRemoteMutation((b: { agentId: string; reason: string; quality?: string; twoFactorCode?: string }) => apiPost<RemoteSession & { twoFactorRequired?: boolean; message?: string }>('/remote/sessions', b));
+export const useEndRemote = () => useRemoteMutation((id: string) => apiPost(`/remote/sessions/${id}/end`, {}));
+/** Hand the target's keyboard and mouse to the operator, or take it back. Audited on the server. */
+export const useSetRemoteInput = () =>
+  useRemoteMutation((v: { id: string; enabled: boolean }) => apiPost(`/remote/sessions/${v.id}/input/enable`, { enabled: v.enabled }));
+/** Stop or resume recording without ending the session. Audited both ways. */
+export const useSetRemoteRecording = () =>
+  useRemoteMutation((v: { id: string; on: boolean }) => apiPost(`/remote/sessions/${v.id}/recording`, { on: v.on }));
+/** Change the console quality mode mid-session (min | medium | good | high). */
+export const useSetRemoteQuality = () =>
+  useRemoteMutation((v: { id: string; mode: string }) => apiPost(`/remote/sessions/${v.id}/quality`, { mode: v.mode }));
+/** Share two-way audio with the target, or stop. Off until the operator opts in; audited both ways. */
+export const useSetRemoteAudio = () =>
+  useRemoteMutation((v: { id: string; enabled: boolean }) => apiPost(`/remote/sessions/${v.id}/audio`, { enabled: v.enabled }));
+
 export const useSettings = () =>
   useQuery({ queryKey: ['settings'], queryFn: () => apiGet<SettingsData>('/settings') });
 
@@ -1134,5 +1192,118 @@ export const useSaveSuppressions = () => {
   return useMutation({
     mutationFn: (windows: import('./types').SuppressionWindowCfg[]) => apiPut('/aiops/suppressions', windows),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['aiops-suppressions'] }),
+  });
+};
+
+// ── Remote-support recording storage (admin) ───────────────────────────────
+export interface RemoteStorage {
+  files: number; bytes: number; mb: number; oldest: string | null;
+  retention: { maxAgeDays: number; maxTotalMb: number; maxSessionMb: number };
+}
+export const useRemoteStorage = () =>
+  useQuery({ queryKey: ['remote-storage'], queryFn: () => apiGet<RemoteStorage>('/remote/storage'), refetchInterval: 30000 });
+export const useClearRemoteStorage = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { olderThanDays?: number }) => apiPost('/remote/storage/clear', v),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['remote-storage'] });
+      qc.invalidateQueries({ queryKey: ['remote-sessions'] });
+    },
+  });
+};
+
+// ── Device uptime & SLA ────────────────────────────────────────────────────
+export interface UptimeOutage { from: string; to: string | null; seconds: number; ongoing: boolean }
+export interface UptimeDay {
+  date: string; upSec: number; downSec: number; unknownSec: number;
+  availabilityPct: number | null; upHours: number; outages: UptimeOutage[];
+}
+export interface UptimeDevice {
+  key: string; type: 'agent' | 'monitor' | 'resource'; name: string; group: string;
+  up: boolean; detail: string;
+  upSec: number; downSec: number; unknownSec: number; observedSec: number; windowSec: number;
+  coveragePct: number; availabilityPct: number | null; outages: number;
+  longestOutageSec: number; totalDowntimeSec: number;
+  slaTargetPct: number; rated: boolean; slaMet: boolean | null; errorBudgetSec: number; errorBudgetUsedPct: number | null;
+  avgUpHoursPerDay: number | null; businessHoursAvailabilityPct: number | null;
+}
+export interface UptimeSummaryData {
+  from: string; to: string; slaTargetPct: number;
+  devices: number; rated: number; unrated: number;
+  meetingSla: number; breachingSla: number; avgAvailabilityPct: number | null;
+  currentlyDown: number; totalDowntimeSec: number;
+  worst: Pick<UptimeDevice, 'key' | 'name' | 'type' | 'group' | 'up' | 'availabilityPct' | 'totalDowntimeSec' | 'outages' | 'slaMet' | 'rated' | 'avgUpHoursPerDay'>[];
+}
+export interface UptimeDetail {
+  key: string; name: string; type: string; group: string; up: boolean | null; detail: string;
+  from: string; to: string; tzOffsetMin: number;
+  summary: Omit<UptimeDevice, 'key' | 'type' | 'name' | 'group' | 'up' | 'detail' | 'avgUpHoursPerDay' | 'businessHoursAvailabilityPct'>;
+  days: UptimeDay[];
+  outages: UptimeOutage[];
+  businessHours: { upSec: number; downSec: number; unknownSec: number; availabilityPct: number | null };
+}
+export const useUptimeSummary = (days = 30) =>
+  useQuery({ queryKey: ['uptime-summary', days], queryFn: () => apiGet<UptimeSummaryData>(`/uptime/summary?days=${days}`), refetchInterval: 60000 });
+export const useUptimeDevices = (days = 30, type = '') =>
+  useQuery({
+    queryKey: ['uptime-devices', days, type],
+    queryFn: () => apiGet<{ from: string; to: string; slaTargetPct: number; devices: UptimeDevice[] }>(`/uptime/devices?days=${days}${type ? `&type=${type}` : ''}`),
+    refetchInterval: 60000,
+  });
+/** Drill-down. `key` is "<type>:<id>" and maps onto the two-segment route. */
+export const useUptimeDevice = (key: string | null, days = 30) =>
+  useQuery({
+    queryKey: ['uptime-device', key, days],
+    queryFn: () => apiGet<UptimeDetail>(`/uptime/devices/${key!.split(':')[0]}/${key!.split(':').slice(1).join(':')}?days=${days}`),
+    enabled: !!key,
+  });
+
+export interface UptimeDayBar {
+  date: string; upSec: number; downSec: number; unknownSec: number;
+  upHours: number; availabilityPct: number | null; outages: UptimeOutage[];
+}
+export interface UptimeHourBucket { hour: number; upSec: number; downSec: number; unknownSec: number }
+export interface UptimeDaySegment { start: number; end: number; up: boolean | null; fromIso: string; toIso: string }
+export interface UptimeDayDetail {
+  key: string; name: string; date: string; tzOffsetMin: number; from: string; to: string;
+  upSec: number; downSec: number; unknownSec: number; upHours: number; availabilityPct: number | null;
+  hours: UptimeHourBucket[]; segments: UptimeDaySegment[]; outages: UptimeOutage[];
+}
+const uptimePath = (key: string) => `${key.split(':')[0]}/${key.split(':').slice(1).join(':')}`;
+/** 30-day bar chart: hours on per day. */
+export const useUptimeDeviceDays = (key: string | null, days = 30) =>
+  useQuery({
+    queryKey: ['uptime-device-days', key, days],
+    queryFn: () => apiGet<{ key: string; tzOffsetMin: number; days: UptimeDayBar[] }>(`/uptime/devices/${uptimePath(key!)}/days?days=${days}`),
+    enabled: !!key,
+  });
+/** One day, hour by hour. Omit `date` for today. */
+export const useUptimeDeviceDay = (key: string | null, date?: string) =>
+  useQuery({
+    queryKey: ['uptime-device-day', key, date ?? 'today'],
+    queryFn: () => apiGet<UptimeDayDetail>(`/uptime/devices/${uptimePath(key!)}/day${date ? `?date=${date}` : ''}`),
+    enabled: !!key,
+  });
+
+// ── Remote-support recording library (admin) ───────────────────────────────
+export interface RecordingPart { part: number; bytes: number; missing: boolean }
+export interface RecordingEntry {
+  id: string; targetName: string; operatorEmail: string; reason: string;
+  startedAt: string; endedAt: string | null; durationSec: number | null;
+  frames: number; consent: string; inputEnabled: boolean;
+  parts: RecordingPart[]; partsAvailable: number; bytes: number; expired: boolean;
+}
+export const useRemoteRecordings = () =>
+  useQuery({ queryKey: ['remote-recordings'], queryFn: () => apiGet<RecordingEntry[]>('/remote/recordings'), refetchInterval: 30000 });
+/** Clear a single session's recording from disk (admin). */
+export const useDeleteRecording = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiDelete(`/remote/sessions/${id}/recording`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['remote-recordings'] });
+      qc.invalidateQueries({ queryKey: ['remote-storage'] });
+    },
   });
 };

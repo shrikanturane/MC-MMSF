@@ -101,6 +101,8 @@ export class SettingsService {
         approvalExpiryDays: (org as any).approvalExpiryDays ?? 7,
         logTtlSettingDays: (org as any).logTtlSettingDays ?? 30,
         sessionTimeoutHours: (org as any).sessionTimeoutHours ?? 12,
+        remoteRequireConsent: (org as any).remoteRequireConsent ?? false,
+        remoteConsentTimeoutSec: (org as any).remoteConsentTimeoutSec ?? 180,
       },
       connections,
       integrations: integrations.map((i) => ({
@@ -139,6 +141,8 @@ export class SettingsService {
     if (sp.approvalExpiryDays !== undefined) data.approvalExpiryDays = clampInt(sp.approvalExpiryDays, 1, 365, 7);
     if (sp.logTtlSettingDays !== undefined) data.logTtlSettingDays = clampInt(sp.logTtlSettingDays, 1, 3650, 30);
     if (sp.sessionTimeoutHours !== undefined) data.sessionTimeoutHours = clampInt(sp.sessionTimeoutHours, 1, 720, 12);
+    if (sp.remoteRequireConsent !== undefined) data.remoteRequireConsent = !!sp.remoteRequireConsent;
+    if (sp.remoteConsentTimeoutSec !== undefined) data.remoteConsentTimeoutSec = clampInt(sp.remoteConsentTimeoutSec, 30, 1800, 180);
     await this.prisma.orgSettings.upsert({ where: { id: 1 }, update: data, create: { id: 1, ...data } });
     bustSysParams(); // apply tunables immediately (the 20s cache would otherwise delay them)
     return this.getAll();

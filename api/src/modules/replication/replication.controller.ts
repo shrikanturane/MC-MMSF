@@ -58,7 +58,10 @@ export class ReplicationController {
 
   @Roles('admin', 'operator')
   @Post(':id/run')
-  run(@Param('id') id: string, @Body() body: { direction?: 'p2s' | 'p2t' | 's2t' }) {
+  run(@Param('id') id: string, @Body() body: { direction?: 'p2s' | 'p2t' | 's2t' | 's2p' }) {
+    // The default stays 'p2s' for compatibility, but runNow now refuses any direction aimed at the node
+    // currently serving — so "Sync now" during an outage is rejected with an explanation instead of
+    // deleting the live secondary's data.
     return this.service.runNow(id, body?.direction ?? 'p2s');
   }
 
@@ -76,8 +79,11 @@ export class ReplicationController {
 
   @Roles('admin', 'operator')
   @Post(':id/promote')
-  promote(@Param('id') id: string, @Body() body: { to?: 'primary' | 'secondary' | 'tertiary' }, @Req() req: any) {
-    return this.service.promote(id, body?.to ?? 'secondary', req.user?.sub || req.user?.email || '');
+  promote(@Param('id') id: string, @Body() body: { to?: 'primary' | 'secondary' | 'tertiary'; force?: boolean }, @Req() req: any) {
+    // force=true completes a fail-back even when the secondary's changes could NOT be carried back to
+    // the primary — i.e. the operator has decided the outage's writes are expendable. Without it, that
+    // fail-back is refused rather than silently discarding them.
+    return this.service.promote(id, body?.to ?? 'secondary', req.user?.sub || req.user?.email || '', 'real', body?.force === true);
   }
 
   @Roles('admin', 'operator')

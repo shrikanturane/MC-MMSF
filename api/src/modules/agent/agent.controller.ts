@@ -56,8 +56,8 @@ export class AgentController {
 
   @Roles('admin', 'operator')
   @Get()
-  list() {
-    return this.service.list();
+  list(@Req() req: any) {
+    return this.service.listForUser(req.user?.sub, req.user?.role);
   }
 
   @Roles('admin', 'operator')

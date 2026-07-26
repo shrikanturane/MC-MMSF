@@ -4,10 +4,12 @@ FROM node:20
 # iputils-ping for ICMP up/down checks (MonitorsService); nmap for external VAPT scanning
 # (vulnerabilities via the vulners NSE script, misconfigurations + threats from exposed services).
 # nsis (makensis) builds the Windows endpoint-agent installer (.exe) on the server.
+# ffmpeg encodes attended-remote-support session recordings (JPEG frames -> H.264); raw frames are
+# ~500MB/15min and would fill the disk, so encoding is not optional.
 # postgresql-client-16 must match the server major version (pg_dump refuses a newer server),
 # so pull it from the official PGDG apt repo rather than Debian's older default client.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends iputils-ping nmap nsis curl ca-certificates gnupg openssl openssh-client \
+ && apt-get install -y --no-install-recommends iputils-ping nmap nsis curl ca-certificates gnupg openssl openssh-client ffmpeg \
  && install -d /usr/share/postgresql-common/pgdg \
  && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \

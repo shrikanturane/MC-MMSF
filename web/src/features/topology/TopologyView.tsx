@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Card, ErrorState, LoadingState, Modal } from '@/components/ui';
-import { useTopology, useProvisionRequest, useProvisionSchema, useControlVm, useDeleteResource } from '@/lib/hooks';
+import { useTopology, useProvisionRequest, useProvisionSchema, useControlVm, useDeleteResource, useAgents } from '@/lib/hooks';
+import { RemoteSupportModal } from '@/features/remote/RemoteSupportModal';
 import { PROVIDER_COLORS, PROVIDER_LABELS } from '@/lib/format';
 import { openConsole, downloadRdp, copySsh, VmActionConfirm, type VmAction } from '@/features/vms/VmsTable';
 import type { TopologyData, TopoProvider, TopoNet, TopoVm, ProvField } from '@/lib/types';
@@ -14,6 +15,22 @@ function ConsoleBtn({ label, onClick }: { label: string; onClick: () => void }) 
 /** VM detail: OS + live CPU/mem/disk, OS-based console (Win→RDP, Linux→SSH), power on/off (no reboot). */
 function VmDetail({ v }: { v: TopoVm }) {
   const control = useControlVm();
+  const [remote, setRemote] = useState(false);
+  // Match this VM to a reporting guest agent: only an agent can show the main console. Match on
+  // hostname/name or any reported IP, and require a recent check-in - a dead agent cannot consent.
+  const agents = useAgents();
+  const remoteAgent = useMemo(() => {
+    const list = agents.data ?? [];
+    const ips = [v.ip].filter(Boolean) as string[];
+    return list.find((a: any) => {
+      const fresh = a.lastSeenAt && Date.now() - new Date(a.lastSeenAt).getTime() < 5 * 60_000;
+      if (!fresh || !/^win/i.test(String(a.os || ''))) return false;
+      const names = [a.hostname, a.name, a.displayName].filter(Boolean).map((x: string) => x.toLowerCase());
+      if (names.includes(String(v.name || '').toLowerCase())) return true;
+      const aIps = String(a.ips || '').split(',').map((x) => x.trim()).filter(Boolean);
+      return ips.some((ip) => aIps.includes(ip));
+    });
+  }, [agents.data, v.name, v.ip]);
   const del = useDeleteResource();
   const [confirm, setConfirm] = useState<VmAction | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -84,6 +101,17 @@ function VmDetail({ v }: { v: TopoVm }) {
               <>
                 <ConsoleBtn label="🖥 RDP (browser)" onClick={() => openConsole(ip, v.name, 'rdp', { provider: v.provider, os: v.os ?? undefined })} />
                 <ConsoleBtn label="⤓ RDP (direct)" onClick={() => downloadRdp(v.id, v.name)} />
+                {/* Attended support: the REAL console, with the user's permission. Only offered where a
+                    guest agent is actually reporting — nothing else can show the main monitor. */}
+                {remoteAgent && (
+                  <button
+                    onClick={() => setRemote(true)}
+                    className="rounded-md border border-success/50 bg-success/10 px-2.5 py-1 text-2xs font-medium text-success hover:bg-success/20"
+                    title="Show this machine's main monitor, with the user's permission. Does not sign them out (unlike RDP)."
+                  >
+                    👁 Remote support
+                  </button>
+                )}
               </>
             ) : (
               <div className="flex w-full flex-col gap-2">
@@ -98,7 +126,17 @@ function VmDetail({ v }: { v: TopoVm }) {
         ) : (
           <div className="text-2xs text-muted">No reachable IP — power on the VM or attach a public IP.</div>
         )}
+        {isWin && !remoteAgent && (
+          <div className="mt-2 text-[10px] text-muted">
+            <b className="text-white">Remote support</b> (showing the main monitor, with the user&apos;s permission) needs the
+            MCMF guest agent reporting on this host — RDP opens a separate session instead and signs the console user out.
+          </div>
+        )}
       </div>
+
+      {remote && remoteAgent && (
+        <RemoteSupportModal agentId={(remoteAgent as any).id} targetName={v.name} onClose={() => setRemote(false)} />
+      )}
 
       {/* Remove from topology / inventory */}
       <div className="mt-3 border-t border-border-soft pt-3">
