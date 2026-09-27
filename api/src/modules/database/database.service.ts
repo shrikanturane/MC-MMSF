@@ -168,7 +168,7 @@ export class DatabaseService implements OnModuleInit {
     const where: string[] = [];
     if (opts.source && (LOG_SOURCES as readonly string[]).includes(opts.source)) where.push(`source='${opts.source}'`);
     if (opts.q) {
-      const safe = opts.q.replace(/'/g, "''");
+      const safe = opts.q.replace(/\\/g, '\\\\').replace(/'/g, "''");
       where.push(`(positionCaseInsensitive(message,'${safe}')>0 OR positionCaseInsensitive(detail,'${safe}')>0 OR positionCaseInsensitive(host,'${safe}')>0 OR positionCaseInsensitive(level,'${safe}')>0)`);
     }
     const lim = Math.min(Math.max(Number(opts.limit) || 50, 1), 200);

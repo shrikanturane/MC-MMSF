@@ -33,7 +33,11 @@ export class AgentTunnelHub {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  authKey(k?: string): boolean { return !!k && k === agentKey(); }
+  authKey(k?: string): boolean {
+    const a = Buffer.from(String(k ?? ''));
+    const b = Buffer.from(agentKey());
+    return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
   has(id: string): boolean { return this.sessions.has(id); }
 
   /** Open a relay session: a server-side listener guacd dials, plus a queued console-open command

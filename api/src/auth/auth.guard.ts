@@ -2,7 +2,7 @@ import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from
 import { Reflector } from '@nestjs/core';
 import { PrismaService } from '../prisma/prisma.service';
 import { IS_PUBLIC_KEY } from './public.decorator';
-import { verifyJwt } from './jwt';
+import { isSessionToken, verifyJwt } from './jwt';
 
 /** Global gate: every route needs a valid Bearer JWT (+ live session) unless marked @Public. */
 @Injectable()
@@ -23,13 +23,14 @@ export class AuthGuard implements CanActivate {
     if (!payload) throw new UnauthorizedException('authentication required');
     // A 2FA pre-auth challenge is NOT a session token — it can't access protected routes.
     if (payload.scope === '2fa') throw new UnauthorizedException('two-factor verification required');
+    // Nor is any other scoped token (e.g. the SSO state nonce anyone can obtain from /auth/sso/:p/start),
+    // or a token with no session behind it.
+    if (!isSessionToken(payload)) throw new UnauthorizedException('authentication required');
 
-    // Session-backed tokens: reject if the session was revoked or expired.
-    if (payload.jti) {
-      const session = await this.prisma.session.findUnique({ where: { id: payload.jti } });
-      if (!session || session.revokedAt || session.expiresAt.getTime() < Date.now()) {
-        throw new UnauthorizedException('session expired or revoked');
-      }
+    // Reject if the session was revoked or expired.
+    const session = await this.prisma.session.findUnique({ where: { id: payload.jti } });
+    if (!session || session.userId !== payload.sub || session.revokedAt || session.expiresAt.getTime() < Date.now()) {
+      throw new UnauthorizedException('session expired or revoked');
     }
     req.user = payload;
     return true;

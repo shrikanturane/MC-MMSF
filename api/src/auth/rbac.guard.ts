@@ -32,7 +32,7 @@ export class RbacGuard implements CanActivate {
     const isWrite = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
 
     // 2. Self-account actions (me, change own password, logout, list/revoke own sessions).
-    if (/\/auth(\/|$)/.test(path)) return true;
+    if (/^\/api\/auth(\/|$)/.test(path)) return true;
 
     // 3. Explicit @Roles(...) override.
     const required = this.reflector.getAllAndOverride<AppRole[]>(ROLES_KEY, [ctx.getHandler(), ctx.getClass()]);

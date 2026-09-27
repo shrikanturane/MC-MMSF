@@ -1,12 +1,13 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Req } from '@nestjs/common';
 import { UsersService } from './users.service';
+import { clientIp } from '../access/access-control.middleware';
 import { AuditService } from '../audit/audit.service';
 
 function actor(req: any) {
   return {
     actorEmail: req.user?.email ?? '',
     actorId: req.user?.sub ?? null,
-    ip: (req.headers['x-forwarded-for']?.split(',')[0] || req.ip || '').toString() || null,
+    ip: clientIp(req) || null,
     userAgent: (req.headers['user-agent'] || '').toString() || null,
   };
 }

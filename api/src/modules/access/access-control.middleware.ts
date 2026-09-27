@@ -56,8 +56,10 @@ export function isBlocked(ipStr: string, entries: any[]): boolean {
 }
 
 export function clientIp(req: any): string {
-  const xff = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
-  return normalizeIp(xff || req?.ip || req?.socket?.remoteAddress || '');
+  // NOT the first X-Forwarded-For entry: nginx appends the real peer to whatever the client sent, so the
+  // first entry is attacker-controlled (blocklist bypass, spoofed audit IPs). With `trust proxy 1` (main.ts)
+  // req.ip is exactly the entry nginx added.
+  return normalizeIp(req?.ip || req?.socket?.remoteAddress || '');
 }
 
 /**
