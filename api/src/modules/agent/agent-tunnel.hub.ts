@@ -40,6 +40,19 @@ export class AgentTunnelHub {
   }
   has(id: string): boolean { return this.sessions.has(id); }
 
+  /** May this key open the tunnel for `sessionId`? The shared key, or the per-agent token of the agent
+   *  the session was opened for (agents present their token once they've adopted one). */
+  async authorize(sessionId: string, k?: string): Promise<boolean> {
+    const s = this.sessions.get(sessionId);
+    if (!s || !k) return false;
+    if (this.authKey(k)) return true;
+    const agent = await this.prisma.agent.findUnique({ where: { id: s.agentId }, select: { token: true } as any }).catch(() => null) as any;
+    if (!agent?.token) return false;
+    const a = Buffer.from(String(k));
+    const b = Buffer.from(String(agent.token));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
   /** Open a relay session: a server-side listener guacd dials, plus a queued console-open command
    *  telling the agent to connect its tunnel back. Returns the (host, port) to put in the guac token. */
   async openConsoleSession(agentId: string, targetPort: number): Promise<{ sessionId: string; relayHost: string; relayPort: number }> {
@@ -72,10 +85,14 @@ export class AgentTunnelHub {
   }
 
   /** The agent's outbound WS arrived for this session — attach it and start bridging. */
-  attachAgentWs(sessionId: string, ws: any) {
+  attachAgentWs(sessionId: string, ws: any, early: Buffer[] = []) {
     const s = this.sessions.get(sessionId);
     if (!s) { try { ws.close(); } catch { /* */ } return; }
     s.agentWs = ws;
+    for (const buf of early) {
+      if (s.relaySocket && s.bridged) s.relaySocket.write(buf);
+      else s.fromAgent.push(buf);
+    }
     ws.on('message', (data: Buffer) => {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
       if (s.relaySocket && s.bridged) s.relaySocket.write(buf);

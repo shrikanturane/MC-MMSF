@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit, UnauthorizedException } from '@nestjs/common';
 import * as fs from 'node:fs';
 import { PrismaService } from '../../prisma/prisma.service';
 import { sysParams, pInt } from '../../system-params';
@@ -23,6 +23,7 @@ import { savingsPct } from './motion';
 import { kbps, profileOf, toQualityMode } from './quality';
 import { DEFAULT_FPS } from './fps';
 import { Recorder, partFile } from './recorder';
+import { decideAgentAuth, REMOTE_AUTH_MIN_AGENT_VERSION, sharedAgentKey } from './agent-auth';
 import { DEFAULT_RETENTION, describePlan, planRetention, type RetentionConfig } from './retention';
 export { DEFAULT_FPS };
 
@@ -312,6 +313,28 @@ export class RemoteService implements OnModuleInit {
    * The tray is the ONLY component that can ask the person at the desk — it is the one that runs inside
    * the interactive session (the SYSTEM service sits in session 0 and has no desktop to draw on).
    */
+  /**
+   * The agent-facing session routes (ack / consent / frame) are @Public, so prove the caller IS this
+   * session's agent: its own token or the shared key. Without this, whoever holds a session id — every
+   * operator who requested one — could answer the consent prompt themselves or ack "nobody at the
+   * console" to skip it. Agents older than the build that sends its key stay allowed (logged) until they
+   * self-update, unless REMOTE_AGENT_AUTH_STRICT=1.
+   */
+  private async assertSessionAgent(id: string, key?: string): Promise<void> {
+    const row = await this.prisma.remoteSession.findUnique({ where: { id }, select: { agentId: true } });
+    if (!row) throw new NotFoundException('remote session not found');
+    const agent = await this.prisma.agent.findUnique({ where: { id: row.agentId }, select: { token: true, version: true, hostname: true } as any }) as any;
+    const verdict = decideAgentAuth({
+      presentedKey: String(key ?? ''),
+      sharedKey: sharedAgentKey(),
+      agentToken: agent?.token ?? null,
+      agentVersion: agent?.version ?? null,
+      strict: ['1', 'true', 'yes'].includes(String(process.env.REMOTE_AGENT_AUTH_STRICT ?? '').toLowerCase()),
+    });
+    if (verdict === 'deny') throw new UnauthorizedException('agent key required for this remote session');
+    if (verdict === 'legacy') this.log.warn(`remote ${String(id).slice(0, 8)}: keyless call from pre-${REMOTE_AUTH_MIN_AGENT_VERSION} agent ${agent?.hostname ?? row.agentId} (allowed until it self-updates)`);
+  }
+
   async agentPoll(body: any) {
     const key = String(body?.key || '').trim();
     if (!key) throw new BadRequestException('key is required');
@@ -348,7 +371,8 @@ export class RemoteService implements OnModuleInit {
    * same core with the binary frame directly, so both paths enforce consent, record, and return the same
    * control reply — the only difference is how the bytes arrive.
    */
-  async ingestFrame(id: string, body: any) {
+  async ingestFrame(id: string, body: any, key?: string) {
+    await this.assertSessionAgent(id, key);
     const b64 = String(body?.jpeg || '');
     if (!b64) throw new BadRequestException('jpeg (base64) is required');
     const buf = Buffer.from(b64, 'base64');
@@ -697,14 +721,16 @@ export class RemoteService implements OnModuleInit {
   }
 
   /** Agent acknowledges and reports who (if anyone) is at the console. Drives prompt-vs-proceed. */
-  async agentAck(id: string, body: any) {
+  async agentAck(id: string, body: any, key?: string) {
+    await this.assertSessionAgent(id, key);
     const interactiveUser = String(body?.interactiveUser || '').trim() || null;
     const row = await this.apply(id, { type: 'agent-ack', interactiveUser });
     return this.view(row);
   }
 
   /** The person at the console answered. */
-  async consentAnswer(id: string, body: any) {
+  async consentAnswer(id: string, body: any, key?: string) {
+    await this.assertSessionAgent(id, key);
     const accept = body?.accept === true;
     const user = String(body?.user || '').trim() || undefined;
     const row = await this.apply(id, accept ? { type: 'user-accept', user } : { type: 'user-decline', user });

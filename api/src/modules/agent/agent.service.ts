@@ -18,7 +18,7 @@ import { encryptJson, decryptJson } from '../../connectors/crypto';
  * on each ingest so an installed agent can self-update when it's older. BUMP THIS whenever the agent
  * scripts (mcmf-tray-agent.ps1 / mcmf-agent-linux.py / the installer) change.
  */
-export const AGENT_VERSION = '1.20.14';
+export const AGENT_VERSION = '1.20.15';
 
 /** Shared agent ingest key (stable, derived from the app key unless overridden). */
 function agentKey(): string {
