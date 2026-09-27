@@ -60,6 +60,9 @@ services:
       GUACD_PORT: "4822"
       # Guest-agent ingest key (machine-to-machine). Defaults to a stable value if unset.
       AGENT_KEY: ${AGENT_KEY:-}
+      # 1 = refuse keyless remote-support ack/consent/frame calls even from agents older than 1.20.15.
+      # Turn on once the whole fleet has self-updated.
+      REMOTE_AGENT_AUTH_STRICT: ${REMOTE_AGENT_AUTH_STRICT:-0}
       # AI assistant / RCA (Anthropic Claude) — optional; also settable in Settings → Integrations.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AI_MODEL: ${AI_MODEL:-claude-sonnet-4-6}
@@ -174,7 +177,7 @@ services:
     image: postgres:16
     container_name: mcmf-std-backup
     environment:
-      PGPASSWORD: mcmf
+      PGPASSWORD: ${POSTGRES_PASSWORD:-mcmf}
     volumes:
       - mcmf-backups:/backups
     depends_on:

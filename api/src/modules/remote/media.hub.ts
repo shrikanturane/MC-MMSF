@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { timingSafeEqual } from 'node:crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RemoteService } from './remote.service';
-import { verifyJwt } from '../../auth/jwt';
+import { isSessionToken, verifyJwt } from '../../auth/jwt';
 
 /**
  * Persistent WebSocket media relay for attended remote support.
@@ -177,7 +177,10 @@ export class RemoteMediaHub {
           const msg = JSON.parse(Buffer.isBuffer(data) ? data.toString('utf8') : String(data));
           if (msg?.t !== 'auth') { ws.close(); return; }
           const payload = (await verifyJwt(String(msg.token || ''))) as any; // await: sync in repo, async (jose) on deployed
-          if (!payload || (payload.role !== 'admin' && payload.role !== 'operator') || payload.scope === '2fa') { ws.close(); return; }
+          if (!isSessionToken(payload) || (payload.role !== 'admin' && payload.role !== 'operator')) { ws.close(); return; }
+          // Same live-session check the HTTP AuthGuard applies — a logged-out/revoked token must not open a viewer.
+          const sess = await this.prisma.session.findUnique({ where: { id: payload.jti } });
+          if (!sess || sess.userId !== payload.sub || sess.revokedAt || sess.expiresAt.getTime() < Date.now()) { ws.close(); return; }
           const row = await this.prisma.remoteSession.findUnique({ where: { id }, select: { id: true } });
           if (!row) { ws.close(); return; }
           // Cap concurrent admins on one shared session.

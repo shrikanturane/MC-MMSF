@@ -4,10 +4,11 @@ import type { Response } from 'express';
 import { AuthService } from './auth.service';
 import { Public } from './public.decorator';
 import { ssoBaseUrl } from './sso';
+import { clientIp } from '../modules/access/access-control.middleware';
 
 function meta(req: any) {
   return {
-    ip: (req.headers['x-forwarded-for']?.split(',')[0] || req.ip || req.socket?.remoteAddress || '').toString() || null,
+    ip: clientIp(req) || null,
     userAgent: (req.headers['user-agent'] || '').toString() || null,
   };
 }

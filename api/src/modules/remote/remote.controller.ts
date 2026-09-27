@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Post, Query, Req, Res } from '@nestjs/common';
 import { RemoteService } from './remote.service';
 import { Roles } from '../../auth/roles.decorator';
 import { Public } from '../../auth/public.decorator';
@@ -96,15 +96,15 @@ export class RemoteController {
   /** Agent reached the console and reports who (if anyone) is sitting at it. */
   @Public()
   @Post('sessions/:id/ack')
-  ack(@Param('id') id: string, @Body() body: any) {
-    return this.service.agentAck(id, body ?? {});
+  ack(@Param('id') id: string, @Body() body: any, @Headers('x-agent-key') key: string) {
+    return this.service.agentAck(id, body ?? {}, key || body?.key);
   }
 
   /** The person at the console clicked Accept or Decline. */
   @Public()
   @Post('sessions/:id/consent')
-  consent(@Param('id') id: string, @Body() body: any) {
-    return this.service.consentAnswer(id, body ?? {});
+  consent(@Param('id') id: string, @Body() body: any, @Headers('x-agent-key') key: string) {
+    return this.service.consentAnswer(id, body ?? {}, key || body?.key);
   }
 
   /**
@@ -113,8 +113,8 @@ export class RemoteController {
    */
   @Public()
   @Post('sessions/:id/frame')
-  frame(@Param('id') id: string, @Body() body: any) {
-    return this.service.ingestFrame(id, body ?? {});
+  frame(@Param('id') id: string, @Body() body: any, @Headers('x-agent-key') key: string) {
+    return this.service.ingestFrame(id, body ?? {}, key || body?.key);
   }
 
   /**

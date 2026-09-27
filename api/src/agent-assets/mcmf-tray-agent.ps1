@@ -888,7 +888,8 @@ function Invoke-RemoteApi([string]$path, $body) {
     Assert-Tls $Cfg.MCMFIP
     $uri = "https://" + $Cfg.MCMFIP + "/api/remote/" + $path
     $json = ($body | ConvertTo-Json -Depth 5)
-    return Invoke-RestMethod -Uri $uri -Method Post -Body $json -ContentType 'application/json' -TimeoutSec 15
+    # The key proves this box IS the session's agent (the server refuses keyless ack/consent/frame).
+    return Invoke-RestMethod -Uri $uri -Method Post -Body $json -ContentType 'application/json' -Headers @{ 'x-agent-key'=(Get-AuthKey $Cfg) } -TimeoutSec 15
 }
 
 $Global:CapSession = $null
@@ -903,6 +904,12 @@ function Init-Capture {
         $Global:CapHttp = New-Object System.Net.Http.HttpClient($h)
         $Global:CapHttp.Timeout = [TimeSpan]::FromSeconds(5)
     }
+    # Frame POSTs must carry the agent key. Re-set every time: the token can be adopted or rotated after
+    # the client was created.
+    try {
+        [void]$Global:CapHttp.DefaultRequestHeaders.Remove('x-agent-key')
+        [void]$Global:CapHttp.DefaultRequestHeaders.TryAddWithoutValidation('x-agent-key', (Get-AuthKey $Cfg))
+    } catch {}
     # 45 keeps a 1080p frame around 60-90KB, which is what makes 10 fps viable over the tunnel.
     try { [McmfShot]::Start(45) } catch {}
 }

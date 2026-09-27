@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Post, Query, Req } from '@nestjs/common';
 import { NetworkService } from './network.service';
+import { clientIp } from '../access/access-control.middleware';
 import { Roles } from '../../auth/roles.decorator';
 
 @Controller('network')
@@ -36,7 +37,7 @@ export class NetworkController {
   // Cloud-aware field schema (auto-populated regions / groups / networks) for the provisioning form.
   @Get('provision/schema')
   provisionSchema(@Query('provider') provider: string, @Query('kind') kind: string, @Query('region') region: string, @Req() req: any) {
-    const adminIp = String(req?.headers?.['x-forwarded-for'] ?? '').split(',')[0].trim() || req?.ip || '';
+    const adminIp = clientIp(req);
     return this.service.provisionSchema(provider, kind, region, adminIp);
   }
 

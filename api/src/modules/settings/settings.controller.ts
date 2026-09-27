@@ -66,7 +66,8 @@ export class SettingsController {
   async asset(@Param('id') id: string, @Res() res: Response) {
     const a = await this.service.getAsset(id);
     if (!a) { res.status(404).end(); return; }
-    res.set({ 'Content-Type': a.mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'Content-Length': String(a.data.length) });
+    // sandbox: an uploaded SVG opened directly must not run script on the app origin (<img> use is unaffected).
+    res.set({ 'Content-Type': a.mime, 'Cache-Control': 'public, max-age=31536000, immutable', 'Content-Length': String(a.data.length), 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox", 'X-Content-Type-Options': 'nosniff' });
     res.end(a.data);
   }
 }

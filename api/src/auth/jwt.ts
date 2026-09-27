@@ -38,6 +38,15 @@ export function signJwt(payload: Omit<JwtPayload, 'iat' | 'exp'>, ttlSec = 60 * 
   return `${header}.${body}.${sig}`;
 }
 
+/**
+ * Only a real login session may act as a bearer credential: it carries a session id (jti) and no scope.
+ * Scoped tokens (2FA challenge, SSO state nonce) are signed with the same key but are NOT sessions —
+ * the SSO state is handed to anonymous callers in the /auth/sso/:p/start redirect.
+ */
+export function isSessionToken(payload: JwtPayload | null | undefined): payload is JwtPayload {
+  return !!payload && !payload.scope && !!payload.jti;
+}
+
 export function verifyJwt(token: string): JwtPayload | null {
   const [h, b, s] = (token || '').split('.');
   if (!h || !b || !s) return null;

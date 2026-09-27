@@ -101,13 +101,18 @@ async function bootstrap() {
     const guacUpgrade = httpServer.listeners('upgrade').slice();
     httpServer.removeAllListeners('upgrade');
     const wss = new WebSocketServer({ noServer: true });
-    wss.on('connection', (ws: any, req: any) => {
+    wss.on('connection', async (ws: any, req: any) => {
       try {
         const u = new URL(req.url, 'http://x');
         const session = u.searchParams.get('session') || '';
         const k = u.searchParams.get('k') || '';
-        if (!hub.authKey(k) || !hub.has(session)) { ws.close(); return; }
-        hub.attachAgentWs(session, ws);
+        // Hold anything the agent sends while the key is checked (SSH/VNC servers speak first).
+        const early: Buffer[] = [];
+        const hold = (d: any) => early.push(Buffer.isBuffer(d) ? d : Buffer.from(d));
+        ws.on('message', hold);
+        if (!(await hub.authorize(session, k))) { ws.close(); return; }
+        ws.off('message', hold);
+        hub.attachAgentWs(session, ws, early);
       } catch { try { ws.close(); } catch { /* */ } }
     });
     // Remote-support media relay (persistent transport replacing JPEG-per-POST). Two paths on the same
